@@ -66,7 +66,8 @@ export function crewRpc(config) {
     }
     const body = res.status === 204 ? null : await res.json().catch(() => null);
     if (!res.ok) {
-      const code = body?.message || `http_${res.status}`;
+      // PGRST202: the crew_* functions don't exist yet (schema.sql not run, or the API hasn't reloaded).
+      const code = body?.code === "PGRST202" ? "not_set_up" : body?.message || `http_${res.status}`;
       throw Object.assign(new Error(code), { code });
     }
     return body;

@@ -156,3 +156,6 @@ grant execute on function
   public.crew_state(text), public.crew_get_sessions(text, uuid, text[]),
   public.crew_save_doc(text, jsonb), public.crew_save_session(text, jsonb), public.crew_delete_session(text, text)
 to anon, authenticated;
+
+-- Tell Supabase's API to pick up the new functions right away.
+notify pgrst, 'reload schema';

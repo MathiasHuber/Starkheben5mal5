@@ -856,6 +856,7 @@ const LOGIN_ERRORS = {
   password_too_short: "Use a password with at least 4 characters.",
   crew_full: "This crew already has 20 accounts.",
   offline: "Can't reach the server. Check your connection and try again.",
+  not_set_up: "The database isn't set up yet. Run supabase/schema.sql in the Supabase SQL Editor, then try again.",
 };
 
 async function submitLogin() {
