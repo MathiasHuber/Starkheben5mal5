@@ -12,9 +12,15 @@ const args = process.argv.slice(2);
 const standalone = args.includes("--standalone");
 const out = args.find((a) => !a.startsWith("--")) ?? join(root, "dist", "starkheben-5x5.html");
 
-const program = read("src/program.js").replace(/^export /gm, "");
-const app = read("src/app.js").replace(/^import \{[\s\S]*?\} from "\.\/program\.js";\n/m, "");
-if (app.includes('from "./program.js"')) throw new Error("app.js import block not stripped");
+// Modules in dependency order; their local imports and exports are stripped so they share one scope.
+const MODULES = ["src/schedule.js", "src/standards.js", "src/program.js", "src/app.js"];
+const scripts = MODULES.map((m) => {
+  const code = read(m)
+    .replace(/^import \{[\s\S]*?\} from "\.\/[\w-]+\.js";\n/gm, "")
+    .replace(/^export /gm, "");
+  if (/^import /m.test(code)) throw new Error(`${m}: unexpected import left after bundling`);
+  return `// ---- ${m} ----\n${code}`;
+}).join("\n");
 
 const html = read("index.html");
 const body = html.slice(html.indexOf("<body>") + 6, html.indexOf("</body>"))
@@ -28,8 +34,7 @@ ${read("src/styles.css")}
 </style>`;
 const content = `${body.trim()}
 <script type="module">
-${program}
-${app}
+${scripts}
 </script>`;
 
 // Default output has no doctype/html/head/body: single-page hosts wrap the file in their own skeleton.

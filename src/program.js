@@ -1,4 +1,6 @@
-// Pure 5x5 program logic: no DOM, no storage. Everything here is unit tested.
+// Pure 5x5 program logic: no DOM, no storage. Everything here is unit tested. All weights are kg.
+import { defaultSchedule, isDateKey } from "./schedule.js";
+import { estimateOneRepMax } from "./standards.js";
 
 export const LIFTS = {
   squat: { name: "Squat", sets: 5, reps: 5 },
@@ -8,47 +10,54 @@ export const LIFTS = {
   deadlift: { name: "Deadlift", sets: 1, reps: 5 },
 };
 
-export const WORKOUTS = {
-  A: ["squat", "bench", "row"],
-  B: ["squat", "ohp", "deadlift"],
-};
+/** Standard 5x5 assistance work (as listed on stronglifts.com). */
+export const ASSISTANCE = [
+  { name: "Pull-ups", sets: 3, reps: 8, unit: "reps" },
+  { name: "Chin-ups", sets: 3, reps: 8, unit: "reps" },
+  { name: "Dips", sets: 3, reps: 8, unit: "reps" },
+  { name: "Skullcrushers", sets: 3, reps: 8, unit: "reps" },
+  { name: "Barbell Curl", sets: 3, reps: 8, unit: "reps" },
+  { name: "Hanging Knee Raises", sets: 3, reps: 8, unit: "reps" },
+  { name: "Plank", sets: 3, reps: 30, unit: "sec" },
+  { name: "Romanian Deadlift", sets: 3, reps: 8, unit: "reps" },
+  { name: "Hip Thrust", sets: 3, reps: 8, unit: "reps" },
+];
 
-const UNIT_DEFAULTS = {
-  kg: {
+const START_WEIGHTS = { squat: 20, bench: 20, row: 30, ohp: 20, deadlift: 40 };
+const KG_PER_LB = 1 / 2.20462;
+
+export function defaultSettings() {
+  return {
     bar: 20,
     plates: [25, 20, 15, 10, 5, 2.5, 1.25],
     increments: { squat: 2.5, bench: 2.5, row: 2.5, ohp: 2.5, deadlift: 5 },
-    start: { squat: 20, bench: 20, row: 30, ohp: 20, deadlift: 40 },
-  },
-  lb: {
-    bar: 45,
-    plates: [45, 35, 25, 10, 5, 2.5],
-    increments: { squat: 5, bench: 5, row: 5, ohp: 5, deadlift: 10 },
-    start: { squat: 45, bench: 45, row: 65, ohp: 45, deadlift: 95 },
-  },
-};
-
-const LB_PER_KG = 2.20462;
-
-export function defaultSettings(unit = "kg") {
-  const d = UNIT_DEFAULTS[unit];
-  return {
-    unit,
-    bar: d.bar,
-    plates: [...d.plates],
-    increments: { ...d.increments },
     deloadPercent: 10,
-    failuresBeforeDeload: 3,
+    deloadSuggestAfter: 3,
     rest: { easy: 90, hard: 180, failed: 300 },
+    topBackoff: { backoffSets: 4, backoffReps: 5, backoffPercent: 10 },
   };
 }
 
-export function createState(unit = "kg") {
+export function defaultTemplates() {
+  const main = (liftId) => ({ type: "main", liftId, scheme: "straight" });
+  return { A: ["squat", "bench", "row"].map(main), B: ["squat", "ohp", "deadlift"].map(main) };
+}
+
+export function createState(today) {
   const lifts = {};
-  for (const id of Object.keys(LIFTS)) {
-    lifts[id] = { weight: UNIT_DEFAULTS[unit].start[id], failures: 0 };
-  }
-  return { version: 1, settings: defaultSettings(unit), lifts, history: [], nextWorkout: "A", active: null };
+  for (const id of Object.keys(LIFTS)) lifts[id] = { weight: START_WEIGHTS[id], failures: 0 };
+  return {
+    version: 2,
+    settings: defaultSettings(),
+    profile: { bodyweight: null, sex: "male" },
+    lifts,
+    templates: defaultTemplates(),
+    schedules: [defaultSchedule(today)],
+    overrides: {},
+    history: [],
+    nextWorkout: "A",
+    active: null,
+  };
 }
 
 /** Smallest weight change the plate set allows: two of the smallest plate. */
@@ -99,62 +108,89 @@ export function warmupSets(liftId, workWeight, settings) {
   return sets;
 }
 
-export function startWorkout(state, now = Date.now()) {
-  const type = state.nextWorkout;
-  return {
-    id: String(now),
-    date: new Date(now).toISOString(),
-    type,
-    exercises: WORKOUTS[type].map((liftId) => ({
-      liftId,
-      weight: state.lifts[liftId].weight,
-      sets: Array(LIFTS[liftId].sets).fill(null),
-    })),
-  };
+/** Back-off weight: the top-set weight minus the back-off %, rounded down to a loadable weight. */
+export function backoffWeight(weight, percent, settings) {
+  return Math.max(settings.bar, roundDown(weight * (1 - percent / 100), loadStep(settings)));
 }
 
-/** Tap cycle for a set: empty → full reps → one fewer … → 0 → empty. */
-export function cycleSet(current, targetReps) {
+/** The sets an exercise asks for: [{ reps, weight, top? }]. */
+export function targetsFor(ex, settings) {
+  if (ex.type === "assist") return Array.from({ length: ex.sets }, () => ({ reps: ex.reps, weight: ex.weight }));
+  const { sets, reps } = LIFTS[ex.liftId];
+  if (ex.scheme === "topBackoff") {
+    const b = ex.backoff ?? settings.topBackoff;
+    const back = backoffWeight(ex.weight, b.backoffPercent, settings);
+    return [{ reps, weight: ex.weight, top: true }, ...Array.from({ length: b.backoffSets }, () => ({ reps: b.backoffReps, weight: back }))];
+  }
+  return Array.from({ length: sets }, () => ({ reps, weight: ex.weight }));
+}
+
+export function startWorkout(state, type, now = Date.now()) {
+  const exercises = state.templates[type].map((item) => {
+    const ex = item.type === "main"
+      ? { type: "main", liftId: item.liftId, scheme: item.scheme, weight: state.lifts[item.liftId].weight,
+          ...(item.scheme === "topBackoff" ? { backoff: { ...state.settings.topBackoff } } : {}) }
+      : { type: "assist", key: item.id, name: item.name, sets: item.sets, reps: item.reps, unit: item.unit, weight: item.weight };
+    return { ...ex, log: Array(targetsFor(ex, state.settings).length).fill(null) };
+  });
+  return { id: String(now), date: new Date(now).toISOString(), type, exercises };
+}
+
+/** Tap cycle for a set: empty → full reps → one fewer … → 0 → empty. Timed sets just toggle. */
+export function cycleSet(current, targetReps, unit = "reps") {
   if (current === null) return targetReps;
-  if (current === 0) return null;
+  if (unit === "sec" || current === 0) return null;
   return current - 1;
 }
 
-/** "skipped" when nothing was logged, otherwise "success" only if every set hit the target. */
-export function exerciseResult(exercise) {
-  const { reps } = LIFTS[exercise.liftId];
-  if (exercise.sets.every((r) => r === null)) return "skipped";
-  return exercise.sets.every((r) => r !== null && r >= reps) ? "success" : "failed";
+/**
+ * "skipped" when nothing was logged. Straight sets succeed only if every set hit its target;
+ * top/back-off succeeds on the top set alone, since progression follows the top set.
+ */
+export function exerciseResult(ex, settings) {
+  if (ex.log.every((r) => r === null)) return "skipped";
+  const targets = targetsFor(ex, settings);
+  const made = (i) => ex.log[i] !== null && ex.log[i] >= targets[i].reps;
+  if (ex.type === "main" && ex.scheme === "topBackoff") return made(0) ? "success" : "failed";
+  return ex.log.every((_, i) => made(i)) ? "success" : "failed";
 }
 
-/** Next weight and failure count for one lift after a session. */
+/** Next weight after a session. Failing never deloads by itself: the lifter decides (see deloadLift). */
 export function progressLift(lift, result, liftId, settings) {
-  if (result === "success") {
-    return { weight: lift.weight + settings.increments[liftId], failures: 0, change: "increase" };
-  }
-  if (result === "failed") {
-    const failures = lift.failures + 1;
-    if (failures >= settings.failuresBeforeDeload) {
-      const reduced = roundDown(lift.weight * (1 - settings.deloadPercent / 100), loadStep(settings));
-      return { weight: Math.max(settings.bar, reduced), failures: 0, change: "deload" };
-    }
-    return { weight: lift.weight, failures, change: "repeat" };
-  }
+  if (result === "success") return { weight: lift.weight + settings.increments[liftId], failures: 0, change: "increase" };
+  if (result === "failed") return { weight: lift.weight, failures: lift.failures + 1, change: "repeat" };
   return { weight: lift.weight, failures: lift.failures, change: "none" };
 }
 
+/** Takes the deload % off and rounds down to a weight the plates can make, never below the empty bar. */
+export function deloadLift(lift, settings) {
+  const reduced = roundDown(lift.weight * (1 - settings.deloadPercent / 100), loadStep(settings));
+  return { weight: Math.max(settings.bar, reduced), failures: 0 };
+}
+
+export const suggestDeload = (lift, settings) => lift.failures >= settings.deloadSuggestAfter;
+
 export function finishWorkout(state, session, now = Date.now()) {
   const lifts = { ...state.lifts };
+  const templates = { ...state.templates, [session.type]: state.templates[session.type].map((t) => ({ ...t })) };
   const exercises = session.exercises.map((ex) => {
-    const result = exerciseResult(ex);
+    const result = exerciseResult(ex, state.settings);
+    const weights = targetsFor(ex, state.settings).map((t) => t.weight);
+    if (ex.type === "assist") {
+      // Carry the assistance weight over to next time.
+      const item = templates[session.type].find((t) => t.id === ex.key);
+      if (item) item.weight = ex.weight;
+      return { ...ex, result, weights };
+    }
     const next = progressLift(lifts[ex.liftId], result, ex.liftId, state.settings);
     lifts[ex.liftId] = { weight: next.weight, failures: next.failures };
-    return { ...ex, result, change: next.change, nextWeight: next.weight };
+    return { ...ex, result, weights, change: next.change, nextWeight: next.weight };
   });
   const entry = { ...session, exercises, finishedAt: new Date(now).toISOString() };
   return {
     ...state,
     lifts,
+    templates,
     history: [entry, ...state.history],
     nextWorkout: session.type === "A" ? "B" : "A",
     active: null,
@@ -166,38 +202,135 @@ export function restTargets(reps, targetReps, settings) {
   return reps < targetReps ? [settings.rest.failed] : [settings.rest.easy, settings.rest.hard];
 }
 
-/** Converts all weights to the other unit, snapping to that unit's plate step. */
-export function switchUnit(state, unit) {
-  if (state.settings.unit === unit) return state;
-  const factor = unit === "lb" ? LB_PER_KG : 1 / LB_PER_KG;
-  const settings = { ...defaultSettings(unit), deloadPercent: state.settings.deloadPercent,
-    failuresBeforeDeload: state.settings.failuresBeforeDeload, rest: { ...state.settings.rest } };
-  const step = loadStep(settings);
-  const lifts = {};
-  for (const [id, l] of Object.entries(state.lifts)) {
-    lifts[id] = { ...l, weight: Math.max(settings.bar, roundNearest(l.weight * factor, step)) };
-  }
-  return { ...state, settings, lifts };
+/** Moves a template item up (-1) or down (+1). */
+export function moveItem(list, index, dir) {
+  const to = index + dir;
+  if (to < 0 || to >= list.length) return list;
+  const next = [...list];
+  [next[index], next[to]] = [next[to], next[index]];
+  return next;
 }
 
-/** Validates imported JSON so a bad file can't corrupt the app. Returns null if invalid. */
-export function validateState(data) {
-  const num = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
-  if (!data || typeof data !== "object") return null;
-  if (!["A", "B"].includes(data.nextWorkout)) return null;
-  const s = data.settings;
-  if (!s || !["kg", "lb"].includes(s.unit) || !num(s.bar) || !Array.isArray(s.plates) || !s.plates.length || !s.plates.every((p) => num(p) && p > 0)) return null;
-  if (!num(s.deloadPercent) || !num(s.failuresBeforeDeload) || !s.rest || !["easy", "hard", "failed"].every((k) => num(s.rest[k]))) return null;
-  for (const id of Object.keys(LIFTS)) {
-    if (!data.lifts?.[id] || !num(data.lifts[id].weight) || !num(data.lifts[id].failures)) return null;
-    if (!num(s.increments?.[id])) return null;
-  }
-  if (!Array.isArray(data.history)) return null;
-  for (const h of data.history) {
-    if (!h || !["A", "B"].includes(h.type) || typeof h.date !== "string" || !Array.isArray(h.exercises)) return null;
+/** Best estimated 1-rep max for a main lift across all logged sets. */
+export function bestOneRepMax(history, liftId) {
+  let best = 0;
+  for (const h of history) {
     for (const ex of h.exercises) {
-      if (!LIFTS[ex?.liftId] || !num(ex.weight) || !Array.isArray(ex.sets) || !ex.sets.every((r) => r === null || num(r))) return null;
+      if (ex.type !== "main" || ex.liftId !== liftId) continue;
+      ex.log.forEach((reps, i) => {
+        best = Math.max(best, estimateOneRepMax(ex.weights?.[i] ?? ex.weight, reps ?? 0));
+      });
     }
   }
+  return best;
+}
+
+/** Chronological working weights for a main lift id or an assistance name. */
+export function liftSeries(history, key) {
+  const points = [];
+  for (const h of [...history].reverse()) {
+    for (const ex of h.exercises) {
+      const match = ex.type === "main" ? ex.liftId === key : ex.name === key;
+      if (match && ex.log.some((r) => r !== null)) points.push({ date: h.date, weight: ex.weight });
+    }
+  }
+  return points;
+}
+
+// ---------- migration and validation ----------
+
+/** Upgrades older saved data (v1: optional lb units, numbers-only set logs) to the current shape. Returns null if invalid. */
+export function migrate(raw, today) {
+  if (!raw || typeof raw !== "object") return null;
+  const data = raw.version === 2 ? raw : migrateV1(raw, today);
+  return data && validateState(data);
+}
+
+function migrateV1(v1, today) {
+  if (!v1.settings || !v1.lifts || !Array.isArray(v1.history)) return null;
+  const factor = v1.settings.unit === "lb" ? KG_PER_LB : 1;
+  const toKg = (w) => (factor === 1 ? w : Math.max(20, roundNearest(w * factor, 2.5)));
+  const settings = defaultSettings();
+  if (factor === 1 && v1.settings.increments) settings.increments = { ...settings.increments, ...v1.settings.increments };
+  if (typeof v1.settings.deloadPercent === "number") settings.deloadPercent = v1.settings.deloadPercent;
+  if (typeof v1.settings.failuresBeforeDeload === "number") settings.deloadSuggestAfter = v1.settings.failuresBeforeDeload;
+  if (v1.settings.rest) settings.rest = { ...settings.rest, ...v1.settings.rest };
+  const lifts = {};
+  for (const id of Object.keys(LIFTS)) {
+    const l = v1.lifts[id];
+    if (!l) return null;
+    lifts[id] = { weight: toKg(l.weight), failures: l.failures ?? 0 };
+  }
+  const history = v1.history.map((h) => ({
+    ...h,
+    exercises: (h.exercises ?? []).map((ex) => ({
+      type: "main",
+      liftId: ex.liftId,
+      scheme: "straight",
+      weight: toKg(ex.weight),
+      log: ex.sets,
+      result: ex.result,
+      change: ex.change,
+      nextWeight: ex.nextWeight === undefined ? undefined : toKg(ex.nextWeight),
+    })),
+  }));
+  return {
+    version: 2,
+    settings,
+    profile: { bodyweight: null, sex: "male" },
+    lifts,
+    templates: defaultTemplates(),
+    schedules: [defaultSchedule(today)],
+    overrides: {},
+    history,
+    nextWorkout: v1.nextWorkout,
+    active: null,
+  };
+}
+
+const num = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+const isType = (v) => v === "A" || v === "B";
+const isName = (v) => typeof v === "string" && v.trim().length > 0 && v.length <= 60;
+
+function validExercise(ex) {
+  if (!ex || !num(ex.weight) || !Array.isArray(ex.log) || !ex.log.every((r) => r === null || num(r))) return false;
+  if (ex.type === "main") return Boolean(LIFTS[ex.liftId]) && ["straight", "topBackoff"].includes(ex.scheme);
+  if (ex.type === "assist") return isName(ex.name) && num(ex.sets) && num(ex.reps) && ["reps", "sec"].includes(ex.unit);
+  return false;
+}
+
+/** Checks an in-progress or finished session. */
+export function validateSession(s) {
+  return Boolean(s) && isType(s.type) && typeof s.date === "string" && Array.isArray(s.exercises) && s.exercises.every(validExercise);
+}
+
+function validTemplateItem(t) {
+  if (t?.type === "main") return Boolean(LIFTS[t.liftId]) && ["straight", "topBackoff"].includes(t.scheme);
+  return t?.type === "assist" && typeof t.id === "string" && isName(t.name) && num(t.sets) && t.sets >= 1 && t.sets <= 10
+    && num(t.reps) && ["reps", "sec"].includes(t.unit) && num(t.weight);
+}
+
+function validSchedule(s) {
+  return s && isDateKey(s.since) && ["alternate", "fixed"].includes(s.mode)
+    && Array.isArray(s.days) && s.days.every((d) => Number.isInteger(d) && d >= 0 && d <= 6)
+    && s.fixed && typeof s.fixed === "object" && Object.entries(s.fixed).every(([d, t]) => /^[0-6]$/.test(d) && (isType(t) || t === null));
+}
+
+/** Validates current-shape data so a bad backup can't corrupt the app. Returns null if invalid. */
+export function validateState(data) {
+  if (!data || typeof data !== "object" || data.version !== 2 || !isType(data.nextWorkout)) return null;
+  const s = data.settings;
+  if (!s || !num(s.bar) || !Array.isArray(s.plates) || !s.plates.length || !s.plates.every((p) => num(p) && p > 0)) return null;
+  if (!num(s.deloadPercent) || !num(s.deloadSuggestAfter) || !s.rest || !["easy", "hard", "failed"].every((k) => num(s.rest[k]))) return null;
+  if (!s.topBackoff || !["backoffSets", "backoffReps", "backoffPercent"].every((k) => num(s.topBackoff[k]))) return null;
+  for (const id of Object.keys(LIFTS)) {
+    if (!data.lifts?.[id] || !num(data.lifts[id].weight) || !num(data.lifts[id].failures) || !num(s.increments?.[id])) return null;
+  }
+  const p = data.profile;
+  if (!p || !(p.bodyweight === null || (num(p.bodyweight) && p.bodyweight > 0)) || !["male", "female"].includes(p.sex)) return null;
+  if (!data.templates || !["A", "B"].every((t) => Array.isArray(data.templates[t]) && data.templates[t].every(validTemplateItem))) return null;
+  if (!Array.isArray(data.schedules) || !data.schedules.length || !data.schedules.every(validSchedule)) return null;
+  if (!data.overrides || typeof data.overrides !== "object" || !Object.entries(data.overrides).every(([k, v]) => isDateKey(k) && isDateKey(v))) return null;
+  if (!Array.isArray(data.history) || !data.history.every(validateSession)) return null;
   return { ...data, active: null };
 }
