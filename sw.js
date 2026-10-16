@@ -1,6 +1,6 @@
 // Offline support: cache the app shell, serve cache first, refresh in the background.
-const CACHE = "starkheben-5x5-v4";
-const ASSETS = ["./", "index.html", "src/styles.css", "src/app.js", "src/program.js", "src/schedule.js", "src/standards.js", "src/sync.js", "src/backends.js", "src/config.js", "vendor/supabase.js", "manifest.webmanifest", "icon.svg"];
+const CACHE = "starkheben-5x5-v5";
+const ASSETS = ["./", "index.html", "src/styles.css", "src/app.js", "src/program.js", "src/schedule.js", "src/standards.js", "src/sync.js", "src/backends.js", "src/config.js", "manifest.webmanifest", "icon.svg"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));

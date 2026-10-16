@@ -31,13 +31,14 @@ All weights are in kg. All the numbers above can be changed in Settings.
 - **Strength standards:** enter bodyweight and sex. For each lift, the app compares your estimated 1-rep max with bodyweight-multiple milestones (Beginner → Novice → Intermediate → Advanced → Elite) and shows the % reached toward the next one. These standards are rough guides.
 - **Backup:** copy/paste JSON backup and restore. Data saved by older versions, including lb data, is upgraded automatically.
 
-## Hosted web version with Google sign-in
+## Hosted web version with accounts
 
-The page is served by GitHub Pages and syncs through Supabase, with "Continue with Google" for sign-in. Only Google accounts on a member list can read or save anything. Members see each other's data in the Crew tab and can only change their own.
+The page is served by GitHub Pages and syncs through Supabase. People create an account with a username and a password, then see each other in the Crew tab. Everyone can read everyone's data, and each person can change only their own.
 
-- **Setup:** follow [docs/SETUP.md](docs/SETUP.md) (GitHub Pages, Supabase project, Google login), then put the project URL and key in `src/config.js`.
-- **Database:** `supabase/schema.sql` creates the tables, the member list, row level security and live updates. Running it twice is safe.
-- **Without config:** if `src/config.js` is empty, the hosted page works without accounts and keeps data on each device.
+- **Setup:** [docs/SETUP.md](docs/SETUP.md) has two steps: run `supabase/schema.sql` in Supabase, then turn on GitHub Pages.
+- **Database access:** the app calls only the `crew_*` database functions. Passwords are bcrypt-hashed, and signing in returns a device token. Security is deliberately minimal (no reset, no rate limiting), so don't reuse a real password.
+- **Updates** from others arrive by polling every 15 seconds and whenever the app comes back to the foreground.
+- **The APK** uses the same accounts. With an empty `src/config.js` the app has no accounts and keeps data on each device.
 
 ## Shared Claude page (alternative)
 
@@ -49,7 +50,7 @@ The app runs as a Claude artifact. Data is stored on claude.ai's servers and syn
 - **Inviting someone:** the owner opens the page's Share menu, invites the partner by email as an **Editor**, and leaves link sharing off. Anyone with view-only access can still look at the crew but can't save, and the header shows "View only".
 - **First connection:** on the first connection from a device, workouts saved only on that device are merged into the server copy.
 
-Outside claude.ai (the APK or a local copy), `window.claude` doesn't exist. The app then runs as before, with data kept in the browser on that device, and the Crew tab stays hidden.
+Outside claude.ai, `window.claude` doesn't exist, and the app uses the Supabase accounts described above.
 
 ## Run it
 
@@ -79,10 +80,9 @@ The first build creates a local signing key, `android/debug.keystore` (not commi
 - `src/schedule.js`: schedules, calendar, rescheduling and streaks
 - `src/standards.js`: strength standards and 1RM estimates
 - `src/sync.js`: mapping state to server documents and merging copies
-- `src/backends.js`: the two sync servers (Claude artifact db, Supabase)
-- `src/config.js`: Supabase project URL and key for the hosted version
+- `src/backends.js`: the two sync servers (Claude artifact db; Supabase with username/password accounts)
+- `src/config.js`: Supabase project URL and publishable key
 - `supabase/schema.sql`: database setup; `docs/SETUP.md`: hosting walkthrough
-- `vendor/supabase.js`: Supabase JS client 2.117.2 (MIT)
 - `src/app.js`: UI, storage and rest timer
 - `tests/`: unit tests for the logic modules
 - `sw.js`, `manifest.webmanifest`, `icon.svg`: offline and install support

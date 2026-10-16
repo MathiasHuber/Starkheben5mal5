@@ -47,83 +47,101 @@ export async function artifactBackend() {
   };
 }
 
-/** Supabase client and the current sign-in, for the hosted web version. Null when not configured. */
-export async function supabaseAuth(config) {
-  if (!config.url || !config.key || typeof window.supabase?.createClient !== "function") return null;
-  const client = window.supabase.createClient(config.url, config.key);
-  const { data } = await client.auth.getSession();
-  return { client, user: data.session?.user ?? null };
+/**
+ * Calls one of the crew_* database functions on the Supabase project (see supabase/schema.sql).
+ * Errors carry `code`: the function's error ("invalid_login", "invalid_token", ...) or "offline".
+ */
+export function crewRpc(config) {
+  if (!config.url || !config.key) return null;
+  return async (fn, args = {}) => {
+    let res;
+    try {
+      res = await fetch(`${config.url}/rest/v1/rpc/${fn}`, {
+        method: "POST",
+        headers: { apikey: config.key, "Content-Type": "application/json" },
+        body: JSON.stringify(args),
+      });
+    } catch {
+      throw Object.assign(new Error("offline"), { code: "offline" });
+    }
+    const body = res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const code = body?.message || `http_${res.status}`;
+      throw Object.assign(new Error(code), { code });
+    }
+    return body;
+  };
 }
 
-const check = ({ data, error }) => {
-  if (error) throw error;
-  return data;
-};
-
-/** Supabase tables (see supabase/schema.sql). `member` is false when the Google account isn't on the member list. */
-export async function supabaseBackend({ client, user }) {
-  const member = check(await client.rpc("is_member"));
-  const id = user.id;
-  const meta = user.user_metadata ?? {};
+/** Username/password accounts on Supabase. Rejects with code "invalid_token" when the login has expired. */
+export async function crewBackend(rpc, token) {
+  const call = (fn, args) => rpc(fn, { p_token: token, ...args });
+  const first = await call("crew_state");
+  const id = first.me.id;
   const names = {};
-  const backend = {
+  const cache = {}; // account id → Map(session id → session)
+
+  /** Bodies for the given session ids, fetching only ones not seen before. */
+  async function sessionsFor(account, ids) {
+    const have = (cache[account] ??= new Map());
+    for (const k of [...have.keys()]) if (!ids.includes(k)) have.delete(k);
+    const missing = ids.filter((k) => !have.has(k));
+    for (let i = 0; i < missing.length; i += 100) {
+      const rows = await call("crew_get_sessions", { p_account: account, p_ids: missing.slice(i, i + 100) });
+      for (const r of rows ?? []) if (r && typeof r.id === "string") have.set(r.id, r);
+    }
+    return [...have.values()];
+  }
+  const idsOf = (state, account) => (state.sessions.find((x) => x.account === account)?.ids ?? []).slice().sort();
+
+  return {
     id,
-    kind: "supabase",
-    member: member === true,
-    email: user.email ?? "",
+    kind: "crew",
+    username: first.me.username,
     async loadOwn() {
-      const [a, s] = await Promise.all([
-        client.from("athletes").select("doc").eq("user_id", id).maybeSingle(),
-        client.from("sessions").select("data").eq("user_id", id),
-      ]);
-      return { doc: check(a)?.doc ?? null, sessions: check(s).map((r) => r.data) };
+      const st = await call("crew_state");
+      return { doc: st.athletes.find((a) => a.id === id)?.doc ?? null, sessions: await sessionsFor(id, idsOf(st, id)) };
     },
-    saveDoc: async (doc) => check(await client.from("athletes").upsert({
-      user_id: id, doc, name: String(meta.full_name || meta.name || "").slice(0, 80),
-      avatar_url: String(meta.avatar_url || meta.picture || "").slice(0, 500), updated_at: new Date().toISOString(),
-    })),
-    saveSession: async (session) => check(await client.from("sessions").upsert({ user_id: id, id: session.id, data: session })),
-    deleteSession: async (sid) => check(await client.from("sessions").delete().eq("user_id", id).eq("id", sid)),
-    watch({ onAthletes, onSessions }) {
-      const loadAthletes = async () => {
-        const rows = check(await client.from("athletes").select("user_id, doc, name, avatar_url"));
-        const map = {};
-        for (const r of rows) {
-          map[r.user_id] = r.doc;
-          names[r.user_id] = { name: r.name || "", avatarUrl: r.avatar_url || "" };
+    saveDoc: (doc) => call("crew_save_doc", { p_doc: doc }),
+    saveSession: (session) => call("crew_save_session", { p_session: session }),
+    deleteSession: (sid) => call("crew_delete_session", { p_id: sid }),
+    watch({ onAthletes, onSessions, onSignedOut }) {
+      // Polling: plenty for a small crew, and it needs nothing beyond the database functions.
+      const seen = {};
+      let busy = false;
+      const poll = async () => {
+        if (busy) return;
+        busy = true;
+        try {
+          const st = await call("crew_state");
+          const map = {};
+          for (const a of st.athletes) {
+            names[a.id] = a.username;
+            if (a.doc) map[a.id] = a.doc;
+          }
+          onAthletes(map);
+          for (const a of st.athletes) {
+            const ids = idsOf(st, a.id);
+            const key = ids.join(",");
+            if (seen[a.id] === key) continue;
+            const list = await sessionsFor(a.id, ids);
+            seen[a.id] = key;
+            onSessions(a.id, list);
+          }
+        } catch (e) {
+          if (e.code === "invalid_token") onSignedOut?.();
+        } finally {
+          busy = false;
         }
-        onAthletes(map);
       };
-      const loadSessions = async (uid) => {
-        const rows = check(await client.from("sessions").select("data").eq("user_id", uid));
-        onSessions(uid, rows.map((r) => r.data));
-      };
-      const loadAllSessions = async () => {
-        const rows = check(await client.from("sessions").select("user_id, data"));
-        const byUser = {};
-        for (const r of rows) (byUser[r.user_id] ??= []).push(r.data);
-        for (const uid of Object.keys(names)) onSessions(uid, byUser[uid] ?? []);
-      };
-      // Coalesce bursts of change events into one reload per table/person.
-      const timers = {};
-      const later = (key, fn) => {
-        clearTimeout(timers[key]);
-        timers[key] = setTimeout(() => fn().catch(() => {}), 400);
-      };
-      client.channel("starkheben")
-        .on("postgres_changes", { event: "*", schema: "public", table: "athletes" }, () => later("athletes", loadAthletes))
-        .on("postgres_changes", { event: "*", schema: "public", table: "sessions" }, (p) => {
-          const uid = p.new?.user_id ?? p.old?.user_id;
-          if (uid) later(`s:${uid}`, () => loadSessions(uid));
-        })
-        .subscribe();
-      loadAthletes().then(loadAllSessions).catch(() => {});
+      poll();
+      setInterval(() => { if (document.visibilityState === "visible") poll(); }, 15000);
+      document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") poll(); });
     },
     async profiles(ids) {
-      return Object.fromEntries(ids.map((i) => [i, { name: names[i]?.name || "", avatarUrl: names[i]?.avatarUrl || "", color: "" }]));
+      return Object.fromEntries(ids.map((i) => [i, { name: names[i] || "", avatarUrl: "", color: "" }]));
     },
-    // Postgres "insufficient privilege" (RLS refusal).
-    isWriteRefusal: (e) => e?.code === "42501",
+    isWriteRefusal: (e) => e?.code === "invalid_token",
+    logout: () => call("crew_logout").catch(() => {}),
   };
-  return backend;
 }

@@ -9,7 +9,7 @@ import {
 } from "./schedule.js";
 import { LEVELS, STANDARDS, estimateOneRepMax, strengthProgress } from "./standards.js";
 import { splitState, assembleState, mergeOnConnect, stableStringify } from "./sync.js";
-import { artifactBackend, supabaseAuth, supabaseBackend } from "./backends.js";
+import { artifactBackend, crewRpc, crewBackend } from "./backends.js";
 import { SUPABASE } from "./config.js";
 
 const STORAGE_KEY = "starkheben5x5";
@@ -29,6 +29,7 @@ const ui = {
   editorType: "A",
   scheduleDraft: null,
   crewLift: "squat",
+  loginMode: "signin",
   crewOpen: null,
 };
 let timer = null; // { start, targets, beeped, missed }
@@ -61,12 +62,14 @@ function save() {
 }
 
 // ---------- server sync ----------
-// The claude.ai page syncs through the artifact db; the hosted web version through Supabase (after
-// "Continue with Google"). The APK and local copies have neither and keep data on the device.
+// The claude.ai page syncs through the artifact db. Everywhere else (GitHub Pages, the APK) the app
+// syncs through Supabase once you sign in with a username and password; without an account, or
+// with no server configured, data stays on the device.
 // Each person has one athlete doc (everything but history) plus one doc per finished session.
 
 let cloud = null; // a backend from backends.js once signed in
-let auth = null; // { client, user } for the Supabase version
+const rpc = crewRpc(SUPABASE); // null when no server is configured
+const TOKEN_KEY = "starkheben5x5-token";
 const crew = { athletes: {}, sessions: {}, profiles: {} };
 const sync = { status: "local", writing: false, dirty: false, readOnly: false, docJson: null, sessionIds: new Set(), lastLocal: -Infinity, written: [] };
 const LOCAL_ONLY_KEY = "starkheben5x5-local-only";
@@ -111,7 +114,9 @@ async function pushCloud() {
     } while (sync.dirty);
     setSync("synced");
   } catch (e) {
-    if (cloud.isWriteRefusal(e)) {
+    if (e?.code === "invalid_token") {
+      signedOutElsewhere();
+    } else if (cloud.isWriteRefusal(e)) {
       // Not allowed to write (e.g. shared as Viewer): keep working on this device.
       sync.readOnly = true;
       setSync("readonly");
@@ -127,18 +132,18 @@ async function pushCloud() {
 async function startCloud() {
   cloud = await artifactBackend();
   if (!cloud) {
-    auth = await supabaseAuth(SUPABASE);
-    if (!auth) return; // no server configured: local only
-    if (!auth.user) {
+    if (!rpc || window.claude) return; // inside claude.ai only the artifact db is reachable
+    const token = readToken();
+    if (!token) {
       if (!localOnly()) showScreen("login");
       return;
     }
     try {
-      const backend = await supabaseBackend(auth);
-      if (!backend.member) return showScreen("not-member");
-      cloud = backend;
-    } catch {
-      setSync("error");
+      cloud = await crewBackend(rpc, token);
+    } catch (e) {
+      if (e.code === "invalid_token") return signedOutElsewhere();
+      setSync("error"); // offline: keep working on this device and try again shortly
+      setTimeout(startCloud, 20000);
       return;
     }
   }
@@ -156,7 +161,7 @@ async function startCloud() {
   } catch {
     setSync("error");
   }
-  cloud.watch({ onAthletes, onSessions });
+  cloud.watch({ onAthletes, onSessions, onSignedOut: signedOutElsewhere });
 }
 
 // Your own data coming back from the server. While you're editing (or just after), the newest copy is
@@ -221,6 +226,18 @@ function applyOwnSessions(list) {
   state = next;
   saveLocal();
   if (!isTyping()) render();
+}
+
+function readToken() {
+  try { return localStorage.getItem(TOKEN_KEY); } catch { return null; }
+}
+
+/** The login stopped working (signed out on the server): ask to sign in again. */
+function signedOutElsewhere() {
+  try { localStorage.removeItem(TOKEN_KEY); } catch { /* storage blocked */ }
+  cloud = null;
+  setSync("local");
+  showScreen("login");
 }
 
 function localOnly() {
@@ -317,8 +334,8 @@ function render() {
     else b.removeAttribute("aria-current");
   }
   const views = { today: todayView, calendar: calendarView, progress: progressView, crew: crewView, program: programView, settings: settingsView,
-    login: loginView, "not-member": notMemberView };
-  document.querySelector(".tabs").hidden = view === "login" || view === "not-member";
+    login: loginView };
+  document.querySelector(".tabs").hidden = view === "login";
   app.innerHTML = views[view]();
   if (view === "crew") {
     const members = crewMembers();
@@ -664,7 +681,7 @@ const memberColor = (m, i) => (m.me ? "var(--accent)" : safeColor(crew.profiles[
 function crewView() {
   if (!cloud) {
     return `<h2>Crew</h2><div class="card"><p>Sign in to share your training with your crew. Right now your data stays on this device only.</p>
-      ${auth ? `<button class="btn primary" data-action="sign-in">Sign in</button>` : ""}</div>`;
+      ${rpc && !window.claude ? `<button class="btn primary" data-action="sign-in">Sign in</button>` : ""}</div>`;
   }
   const members = crewMembers();
   refreshProfiles(members.map((m) => m.id));
@@ -675,8 +692,8 @@ function crewView() {
     points: liftSeries(m.state.history, ui.crewLift),
   }));
   const alone = members.length < 2
-    ? `<div class="card"><p class="small">Nobody else has signed in yet. ${cloud.kind === "supabase"
-      ? "Send your training partner the link to this page. Their Google address must be on the member list in Supabase."
+    ? `<div class="card"><p class="small">Nobody else has signed in yet. ${cloud.kind === "crew"
+      ? "Send your training partner the link to this page. They create their own account on the sign-in screen."
       : "Share this page with your training partner as an <strong>Editor</strong> (Share menu → invite by email)."} Once they've opened it, they show up here.</p></div>` : "";
   return `<div class="row between head"><h2>Crew</h2></div>
     ${alone}
@@ -817,36 +834,54 @@ function templateEditor(type) {
 
 // ---------- sign-in ----------
 
-const GOOGLE_G = `<svg class="g-logo" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>`;
-
 function loginView() {
-  return `<div class="login">
-    <h2>Train 5×5 with your crew</h2>
-    <p class="muted">Sign in to keep your workouts on every device and see your training partner's progress.</p>
-    <button class="google-btn" data-action="google-login">${GOOGLE_G}<span>Continue with Google</span></button>
-    <p class="small muted" id="login-status" role="status"></p>
-    <button class="btn link" data-action="local-only">Use without an account (this device only)</button>
-  </div>`;
+  const register = ui.loginMode === "register";
+  return `<form class="login" id="login-form">
+    <h2>${register ? "Create your account" : "Train 5×5 with your crew"}</h2>
+    <p class="muted">${register ? "Pick a username your crew will see." : "Sign in to keep your workouts on every device and see your training partner's progress."}</p>
+    <label class="field wide"><span>Username</span><input type="text" id="login-username" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="20" required></label>
+    <label class="field wide"><span>Password</span><input type="password" id="login-password" autocomplete="${register ? "new-password" : "current-password"}" required></label>
+    ${register ? `<p class="small muted">Don't reuse a password from anywhere else. This app keeps things simple, not secret.</p>` : ""}
+    <button class="btn primary block" type="submit">${register ? "Create account" : "Sign in"}</button>
+    <p class="small" id="login-status" role="status"></p>
+    <button class="btn link" type="button" data-action="login-mode">${register ? "I already have an account" : "New here? Create an account"}</button>
+    <button class="btn link small" type="button" data-action="local-only">Use without an account (this device only)</button>
+  </form>`;
 }
 
-function notMemberView() {
-  const email = auth?.user?.email ?? "";
-  return `<div class="login">
-    <h2>Not on the member list</h2>
-    <p>The Google account <strong class="nowrap">${esc(email)}</strong> isn't allowed in this crew yet.</p>
-    <p class="small muted">Ask the person who set up the app to add this address to the member list in Supabase, then sign in again.</p>
-    <button class="btn primary" data-action="sign-out">Sign out</button>
-    <button class="btn link" data-action="local-only">Use without an account (this device only)</button>
-  </div>`;
+const LOGIN_ERRORS = {
+  invalid_login: "Wrong username or password.",
+  username_taken: "That username is taken. Pick another one.",
+  invalid_username: "Usernames are 3–20 characters: letters, numbers, dots, dashes or underscores.",
+  password_too_short: "Use a password with at least 4 characters.",
+  crew_full: "This crew already has 20 accounts.",
+  offline: "Can't reach the server. Check your connection and try again.",
+};
+
+async function submitLogin() {
+  const status = document.getElementById("login-status");
+  const username = document.getElementById("login-username").value.trim();
+  const password = document.getElementById("login-password").value;
+  status.textContent = ui.loginMode === "register" ? "Creating account…" : "Signing in…";
+  try {
+    const result = await rpc(ui.loginMode === "register" ? "crew_register" : "crew_login", { p_username: username, p_password: password });
+    try {
+      localStorage.setItem(TOKEN_KEY, result.token);
+      localStorage.removeItem(LOCAL_ONLY_KEY);
+    } catch { /* storage blocked */ }
+    location.reload();
+  } catch (e) {
+    status.textContent = LOGIN_ERRORS[e.code] ?? `Something went wrong (${e.code}). Try again.`;
+  }
 }
 
 function accountCard() {
-  if (cloud?.kind === "supabase") {
-    return `<div class="card row between wrap"><span class="small">Signed in as <strong>${esc(cloud.email)}</strong></span>
+  if (cloud?.kind === "crew") {
+    return `<div class="card row between wrap"><span class="small">Signed in as <strong>${esc(cloud.username)}</strong></span>
       <button class="btn" data-action="sign-out">Sign out</button></div>`;
   }
   if (cloud?.kind === "artifact") return `<div class="card small">Synced with your Claude account.</div>`;
-  if (auth) {
+  if (rpc && !window.claude) {
     return `<div class="card row between wrap"><span class="small">Not signed in. Your data stays on this device.</span>
       <button class="btn primary" data-action="sign-in">Sign in</button></div>`;
   }
@@ -978,15 +1013,7 @@ const actions = {
     ui.calSelected = original;
   },
   "progress-key"(el) { ui.progressKey = el.dataset.key; },
-  async "google-login"() {
-    const status = document.getElementById("login-status");
-    const { error } = await auth.client.auth.signInWithOAuth({
-      provider: "google",
-      options: { redirectTo: location.href.split(/[?#]/)[0] },
-    });
-    if (error && status) status.textContent = `Sign-in didn't start: ${error.message}`;
-    return false; // the browser leaves for Google
-  },
+  "login-mode"() { ui.loginMode = ui.loginMode === "register" ? "signin" : "register"; },
   "local-only"() {
     try { localStorage.setItem(LOCAL_ONLY_KEY, "1"); } catch { /* storage blocked */ }
     view = "today";
@@ -997,7 +1024,8 @@ const actions = {
   },
   async "sign-out"() {
     if (cloud && !(await ask("Sign out? Your data stays saved on the server.", "Sign out"))) return false;
-    await auth?.client.auth.signOut();
+    await cloud?.logout?.();
+    try { localStorage.removeItem(TOKEN_KEY); } catch { /* storage blocked */ }
     // Clear this device's copy so the next person to sign in here starts clean.
     try { localStorage.removeItem(STORAGE_KEY); } catch { /* storage blocked */ }
     location.reload();
@@ -1117,7 +1145,10 @@ document.addEventListener("change", async (e) => {
   render();
 });
 
-document.addEventListener("submit", (e) => e.preventDefault());
+document.addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (e.target.id === "login-form") submitLogin();
+});
 
 // Backups go through a text box: downloads and file saves are blocked in some embedded views.
 function backupStatus(msg) {
