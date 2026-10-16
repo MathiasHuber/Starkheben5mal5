@@ -9,6 +9,8 @@ import {
 } from "./schedule.js";
 import { LEVELS, STANDARDS, estimateOneRepMax, strengthProgress } from "./standards.js";
 import { splitState, assembleState, mergeOnConnect, stableStringify } from "./sync.js";
+import { artifactBackend, supabaseAuth, supabaseBackend } from "./backends.js";
+import { SUPABASE } from "./config.js";
 
 const STORAGE_KEY = "starkheben5x5";
 const app = document.getElementById("app");
@@ -52,19 +54,22 @@ function saveLocal() {
 
 function save() {
   saveLocal();
+  const { doc, sessions } = splitState(state);
+  const changed = stableStringify(doc) !== sync.docJson || sessions.length !== sync.sessionIds.size;
+  if (changed) sync.lastLocal = performance.now();
   pushCloud();
 }
 
-// ---------- server sync (Claude artifact db; absent in the APK and local copies) ----------
-// Each person has athletes/<id> (everything but history) and athletes/<id>/sessions/<sessionId>.
-// Everyone reads all athletes; each person writes only their own (see the db rules at publish).
+// ---------- server sync ----------
+// The claude.ai page syncs through the artifact db; the hosted web version through Supabase (after
+// "Continue with Google"). The APK and local copies have neither and keep data on the device.
+// Each person has one athlete doc (everything but history) plus one doc per finished session.
 
-let cloud = null; // { db, user, id }
-const crew = { athletes: {}, sessions: {}, profiles: {}, unsubs: {} };
-const sync = { status: "local", writing: false, dirty: false, readOnly: false, docJson: null, sessionIds: new Set() };
-
-const athleteRef = () => cloud.db.doc(`athletes/${cloud.id}`);
-const sessionsRef = (id = cloud.id) => cloud.db.collection(`athletes/${id}/sessions`);
+let cloud = null; // a backend from backends.js once signed in
+let auth = null; // { client, user } for the Supabase version
+const crew = { athletes: {}, sessions: {}, profiles: {} };
+const sync = { status: "local", writing: false, dirty: false, readOnly: false, docJson: null, sessionIds: new Set(), lastLocal: -Infinity, written: [] };
+const LOCAL_ONLY_KEY = "starkheben5x5-local-only";
 
 function setSync(status) {
   sync.status = status;
@@ -89,24 +94,25 @@ async function pushCloud() {
       const ids = new Set(sessions.map((h) => h.id));
       for (const h of sessions) {
         if (sync.sessionIds.has(h.id)) continue;
-        await sessionsRef().doc(h.id).set(h);
+        await cloud.saveSession(h);
         sync.sessionIds.add(h.id);
       }
       for (const id of [...sync.sessionIds]) {
         if (ids.has(id)) continue;
-        await sessionsRef().doc(id).delete();
+        await cloud.deleteSession(id);
         sync.sessionIds.delete(id);
       }
       const json = stableStringify(doc);
       if (json !== sync.docJson) {
-        await athleteRef().set(doc);
+        await cloud.saveDoc(doc);
         sync.docJson = json;
+        sync.written = [...sync.written.slice(-19), json]; // recognise late echoes of these writes
       }
     } while (sync.dirty);
     setSync("synced");
   } catch (e) {
-    if (e?.code === "invalid_argument") {
-      // Not allowed to write here (e.g. shared as Viewer): keep working locally.
+    if (cloud.isWriteRefusal(e)) {
+      // Not allowed to write (e.g. shared as Viewer): keep working on this device.
       sync.readOnly = true;
       setSync("readonly");
     } else {
@@ -119,17 +125,29 @@ async function pushCloud() {
 }
 
 async function startCloud() {
-  if (typeof window.claude?.use !== "function") return;
-  const [db, user] = await Promise.all([window.claude.use("db"), window.claude.use("user")]);
-  const id = db && user ? await user.id() : null;
-  if (!id) return; // signed out or no server here: stay local
-  cloud = { db, user, id };
+  cloud = await artifactBackend();
+  if (!cloud) {
+    auth = await supabaseAuth(SUPABASE);
+    if (!auth) return; // no server configured: local only
+    if (!auth.user) {
+      if (!localOnly()) showScreen("login");
+      return;
+    }
+    try {
+      const backend = await supabaseBackend(auth);
+      if (!backend.member) return showScreen("not-member");
+      cloud = backend;
+    } catch {
+      setSync("error");
+      return;
+    }
+  }
   document.querySelector('.tabs [data-view="crew"]').hidden = false;
   setSync("loading");
   try {
-    const [docSnap, sessSnap] = await Promise.all([athleteRef().get(), sessionsRef().get()]);
-    const remote = docSnap.exists ? assembleState(docSnap.data(), sessSnap.docs.map((d) => d.data())) : null;
-    sync.sessionIds = new Set(sessSnap.docs.map((d) => d.id));
+    const own = await cloud.loadOwn();
+    const remote = own.doc ? assembleState(own.doc, own.sessions) : null;
+    sync.sessionIds = new Set(own.sessions.map((h) => h?.id).filter((id) => typeof id === "string"));
     if (remote) sync.docJson = stableStringify(splitState(remote).doc);
     state = mergeOnConnect(state, remote);
     saveLocal();
@@ -138,50 +156,81 @@ async function startCloud() {
   } catch {
     setSync("error");
   }
-  watchOwnData();
-  watchCrew();
+  cloud.watch({ onAthletes, onSessions });
 }
 
-/** Live updates from your other devices. */
-function watchOwnData() {
-  athleteRef().onSnapshot((snap) => {
-    if (!snap.exists || snap.metadata.hasPendingWrites) return;
-    const next = assembleState(snap.data(), state.history);
-    if (!next) return;
-    const json = stableStringify(splitState(next).doc);
-    if (json === sync.docJson || sync.writing) return;
-    sync.docJson = json;
-    state = next;
-    saveLocal();
-    if (!isTyping()) render();
-  }, () => {});
-  sessionsRef().onSnapshot((snap) => {
-    if (snap.metadata.hasPendingWrites || sync.writing) return;
-    const ids = new Set(snap.docs.map((d) => d.id));
-    if (ids.size === sync.sessionIds.size && [...ids].every((id) => sync.sessionIds.has(id))) return;
-    const next = assembleState(splitState(state).doc, snap.docs.map((d) => d.data()));
-    if (!next) return;
-    sync.sessionIds = ids;
-    state = next;
-    saveLocal();
-    if (!isTyping()) render();
-  }, () => {});
+// Your own data coming back from the server. While you're editing (or just after), the newest copy is
+// held and applied once you pause; copies matching something this device wrote are echoes and ignored.
+const recentLocalChange = () => sync.writing || performance.now() - sync.lastLocal < 3000;
+const pendingOwn = { doc: null, sessions: null, timer: null };
+
+function deferOwn() {
+  clearTimeout(pendingOwn.timer);
+  pendingOwn.timer = setTimeout(() => {
+    const { doc, sessions } = pendingOwn;
+    pendingOwn.doc = pendingOwn.sessions = null;
+    if (doc) applyOwnDoc(doc);
+    if (sessions) applyOwnSessions(sessions);
+  }, 3200);
 }
 
-/** Everyone's athlete docs, plus each other person's sessions for charts and streaks. */
-function watchCrew() {
-  cloud.db.collection("athletes").onSnapshot((snap) => {
-    crew.athletes = {};
-    for (const d of snap.docs) {
-      crew.athletes[d.id] = d.data();
-      if (d.id === cloud.id || crew.unsubs[d.id]) continue;
-      crew.unsubs[d.id] = sessionsRef(d.id).onSnapshot((s) => {
-        crew.sessions[d.id] = s.docs.map((x) => x.data());
-        if (view === "crew" && !isTyping()) render();
-      }, () => {});
-    }
+function onAthletes(map) {
+  crew.athletes = map;
+  if (map[cloud.id] && applyOwnDoc(map[cloud.id])) return;
+  if (view === "crew" && !isTyping()) render();
+}
+
+/** Returns true when it changed state (and rendered). */
+function applyOwnDoc(doc) {
+  const next = assembleState(doc, state.history);
+  if (!next) return false;
+  const json = stableStringify(splitState(next).doc);
+  if (json === sync.docJson || sync.written.includes(json)) return false; // up to date, or an echo
+  if (recentLocalChange()) {
+    pendingOwn.doc = doc;
+    deferOwn();
+    return false;
+  }
+  sync.docJson = json;
+  state = next;
+  saveLocal();
+  if (!isTyping()) render();
+  return true;
+}
+
+function onSessions(uid, list) {
+  if (uid !== cloud.id) {
+    crew.sessions[uid] = list;
     if (view === "crew" && !isTyping()) render();
-  }, () => {});
+    return;
+  }
+  applyOwnSessions(list);
+}
+
+function applyOwnSessions(list) {
+  const ids = new Set(list.map((h) => h?.id));
+  if (ids.size === sync.sessionIds.size && [...ids].every((id) => sync.sessionIds.has(id))) return;
+  if (recentLocalChange()) {
+    pendingOwn.sessions = list;
+    deferOwn();
+    return;
+  }
+  const next = assembleState(splitState(state).doc, list);
+  if (!next) return;
+  sync.sessionIds = ids;
+  state = next;
+  saveLocal();
+  if (!isTyping()) render();
+}
+
+function localOnly() {
+  try { return localStorage.getItem(LOCAL_ONLY_KEY) === "1"; } catch { return false; }
+}
+
+/** Full-screen views without tabs: sign-in and the not-on-the-list notice. */
+function showScreen(name) {
+  view = name;
+  render();
 }
 
 const isTyping = () => document.activeElement?.matches?.("input, textarea, select") ?? false;
@@ -267,7 +316,9 @@ function render() {
     if (b.dataset.view === view) b.setAttribute("aria-current", "page");
     else b.removeAttribute("aria-current");
   }
-  const views = { today: todayView, calendar: calendarView, progress: progressView, crew: crewView, program: programView, settings: settingsView };
+  const views = { today: todayView, calendar: calendarView, progress: progressView, crew: crewView, program: programView, settings: settingsView,
+    login: loginView, "not-member": notMemberView };
+  document.querySelector(".tabs").hidden = view === "login" || view === "not-member";
   app.innerHTML = views[view]();
   if (view === "crew") {
     const members = crewMembers();
@@ -612,7 +663,8 @@ const memberColor = (m, i) => (m.me ? "var(--accent)" : safeColor(crew.profiles[
 
 function crewView() {
   if (!cloud) {
-    return `<h2>Crew</h2><div class="card"><p>Open the shared web link while signed in to Claude to see your crew. This copy of the app keeps data on this device only.</p></div>`;
+    return `<h2>Crew</h2><div class="card"><p>Sign in to share your training with your crew. Right now your data stays on this device only.</p>
+      ${auth ? `<button class="btn primary" data-action="sign-in">Sign in</button>` : ""}</div>`;
   }
   const members = crewMembers();
   refreshProfiles(members.map((m) => m.id));
@@ -623,7 +675,9 @@ function crewView() {
     points: liftSeries(m.state.history, ui.crewLift),
   }));
   const alone = members.length < 2
-    ? `<div class="card"><p class="small">Nobody else has opened the app yet. Share this page with your training partner as an <strong>Editor</strong> (Share menu → invite by email). Once they've opened it, they show up here.</p></div>` : "";
+    ? `<div class="card"><p class="small">Nobody else has signed in yet. ${cloud.kind === "supabase"
+      ? "Send your training partner the link to this page. Their Google address must be on the member list in Supabase."
+      : "Share this page with your training partner as an <strong>Editor</strong> (Share menu → invite by email)."} Once they've opened it, they show up here.</p></div>` : "";
   return `<div class="row between head"><h2>Crew</h2></div>
     ${alone}
     <div class="chips" role="group" aria-label="Lift">${liftChips(Object.keys(LIFTS), ui.crewLift, "crew-lift")}</div>
@@ -663,8 +717,8 @@ function memberCard(m, i) {
 }
 
 function refreshProfiles(ids) {
-  if (!cloud?.user) return;
-  cloud.user.profiles(ids).then((ps) => {
+  if (!cloud) return;
+  cloud.profiles(ids).then((ps) => {
     const before = JSON.stringify(crew.profiles);
     for (const id of ids) crew.profiles[id] = { name: ps[id]?.name || "", color: ps[id]?.color || "", avatarUrl: ps[id]?.avatarUrl || "" };
     if (JSON.stringify(crew.profiles) !== before && view === "crew") render();
@@ -761,6 +815,44 @@ function templateEditor(type) {
     </div>`;
 }
 
+// ---------- sign-in ----------
+
+const GOOGLE_G = `<svg class="g-logo" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>`;
+
+function loginView() {
+  return `<div class="login">
+    <h2>Train 5×5 with your crew</h2>
+    <p class="muted">Sign in to keep your workouts on every device and see your training partner's progress.</p>
+    <button class="google-btn" data-action="google-login">${GOOGLE_G}<span>Continue with Google</span></button>
+    <p class="small muted" id="login-status" role="status"></p>
+    <button class="btn link" data-action="local-only">Use without an account (this device only)</button>
+  </div>`;
+}
+
+function notMemberView() {
+  const email = auth?.user?.email ?? "";
+  return `<div class="login">
+    <h2>Not on the member list</h2>
+    <p>The Google account <strong class="nowrap">${esc(email)}</strong> isn't allowed in this crew yet.</p>
+    <p class="small muted">Ask the person who set up the app to add this address to the member list in Supabase, then sign in again.</p>
+    <button class="btn primary" data-action="sign-out">Sign out</button>
+    <button class="btn link" data-action="local-only">Use without an account (this device only)</button>
+  </div>`;
+}
+
+function accountCard() {
+  if (cloud?.kind === "supabase") {
+    return `<div class="card row between wrap"><span class="small">Signed in as <strong>${esc(cloud.email)}</strong></span>
+      <button class="btn" data-action="sign-out">Sign out</button></div>`;
+  }
+  if (cloud?.kind === "artifact") return `<div class="card small">Synced with your Claude account.</div>`;
+  if (auth) {
+    return `<div class="card row between wrap"><span class="small">Not signed in. Your data stays on this device.</span>
+      <button class="btn primary" data-action="sign-in">Sign in</button></div>`;
+  }
+  return "";
+}
+
 // ---------- settings ----------
 
 function settingsView() {
@@ -769,6 +861,7 @@ function settingsView() {
   const field = (label, name, value, attrs = "") =>
     `<label class="field"><span>${esc(label)}</span><input type="number" inputmode="decimal" id="set-${esc(name)}" name="${esc(name)}" value="${esc(value)}" ${attrs}></label>`;
   return `<h2>Settings</h2>
+    ${accountCard()}
     <form class="card" id="settings">
       <h3>You</h3>
       <label class="field wide"><span>Name for your crew</span><input type="text" id="profile-nickname" data-input="profile-nickname" maxlength="30" value="${esc(state.profile.nickname ?? "")}" placeholder="e.g. Mathias"></label>
@@ -885,6 +978,31 @@ const actions = {
     ui.calSelected = original;
   },
   "progress-key"(el) { ui.progressKey = el.dataset.key; },
+  async "google-login"() {
+    const status = document.getElementById("login-status");
+    const { error } = await auth.client.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo: location.href.split(/[?#]/)[0] },
+    });
+    if (error && status) status.textContent = `Sign-in didn't start: ${error.message}`;
+    return false; // the browser leaves for Google
+  },
+  "local-only"() {
+    try { localStorage.setItem(LOCAL_ONLY_KEY, "1"); } catch { /* storage blocked */ }
+    view = "today";
+  },
+  "sign-in"() {
+    try { localStorage.removeItem(LOCAL_ONLY_KEY); } catch { /* storage blocked */ }
+    view = "login";
+  },
+  async "sign-out"() {
+    if (cloud && !(await ask("Sign out? Your data stays saved on the server.", "Sign out"))) return false;
+    await auth?.client.auth.signOut();
+    // Clear this device's copy so the next person to sign in here starts clean.
+    try { localStorage.removeItem(STORAGE_KEY); } catch { /* storage blocked */ }
+    location.reload();
+    return false;
+  },
   "crew-lift"(el) { ui.crewLift = el.dataset.key; },
   "crew-open"(el) { ui.crewOpen = ui.crewOpen === el.dataset.member ? null : el.dataset.member; },
   "schedule-mode"(el) { ui.scheduleDraft.mode = el.dataset.mode; },

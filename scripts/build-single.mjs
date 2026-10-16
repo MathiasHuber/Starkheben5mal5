@@ -13,7 +13,8 @@ const standalone = args.includes("--standalone");
 const out = args.find((a) => !a.startsWith("--")) ?? join(root, "dist", "starkheben-5x5.html");
 
 // Modules in dependency order; their local imports and exports are stripped so they share one scope.
-const MODULES = ["src/schedule.js", "src/standards.js", "src/program.js", "src/sync.js", "src/app.js"];
+// The single-file build has no Supabase client: it syncs through Claude (artifact) or not at all (APK).
+const MODULES = ["src/config.js", "src/schedule.js", "src/standards.js", "src/program.js", "src/sync.js", "src/backends.js", "src/app.js"];
 const scripts = MODULES.map((m) => {
   const code = read(m)
     .replace(/^import \{[\s\S]*?\} from "\.\/[\w-]+\.js";\n/gm, "")
@@ -24,6 +25,7 @@ const scripts = MODULES.map((m) => {
 
 const html = read("index.html");
 const body = html.slice(html.indexOf("<body>") + 6, html.indexOf("</body>"))
+  .replace(/\s*<script src="vendor\/supabase\.js"><\/script>/, "")
   .replace(/\s*<script type="module" src="src\/app\.js"><\/script>/, "");
 
 const head = `<title>Starkheben 5×5</title>

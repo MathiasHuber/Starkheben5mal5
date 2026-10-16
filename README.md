@@ -31,7 +31,15 @@ All weights are in kg. All the numbers above can be changed in Settings.
 - **Strength standards:** enter bodyweight and sex. For each lift, the app compares your estimated 1-rep max with bodyweight-multiple milestones (Beginner → Novice → Intermediate → Advanced → Elite) and shows the % reached toward the next one. These standards are rough guides.
 - **Backup:** copy/paste JSON backup and restore. Data saved by older versions, including lb data, is upgraded automatically.
 
-## Shared web version (you and your training partners)
+## Hosted web version with Google sign-in
+
+The page is served by GitHub Pages and syncs through Supabase, with "Continue with Google" for sign-in. Only Google accounts on a member list can read or save anything. Members see each other's data in the Crew tab and can only change their own.
+
+- **Setup:** follow [docs/SETUP.md](docs/SETUP.md) (GitHub Pages, Supabase project, Google login), then put the project URL and key in `src/config.js`.
+- **Database:** `supabase/schema.sql` creates the tables, the member list, row level security and live updates. Running it twice is safe.
+- **Without config:** if `src/config.js` is empty, the hosted page works without accounts and keeps data on each device.
+
+## Shared Claude page (alternative)
 
 The app runs as a Claude artifact. Data is stored on claude.ai's servers and synced live between devices, and everyone signs in with their own Claude account. There is no separate login.
 
@@ -71,6 +79,10 @@ The first build creates a local signing key, `android/debug.keystore` (not commi
 - `src/schedule.js`: schedules, calendar, rescheduling and streaks
 - `src/standards.js`: strength standards and 1RM estimates
 - `src/sync.js`: mapping state to server documents and merging copies
+- `src/backends.js`: the two sync servers (Claude artifact db, Supabase)
+- `src/config.js`: Supabase project URL and key for the hosted version
+- `supabase/schema.sql`: database setup; `docs/SETUP.md`: hosting walkthrough
+- `vendor/supabase.js`: Supabase JS client 2.117.2 (MIT)
 - `src/app.js`: UI, storage and rest timer
 - `tests/`: unit tests for the logic modules
 - `sw.js`, `manifest.webmanifest`, `icon.svg`: offline and install support
