@@ -8,6 +8,7 @@ import {
   streakWeeks, setSchedule, moveOccurrence, scheduleOn, daysPerWeek, historyKey,
 } from "./schedule.js";
 import { LEVELS, STANDARDS, estimateOneRepMax, strengthProgress } from "./standards.js";
+import { splitState, assembleState, mergeOnConnect, stableStringify } from "./sync.js";
 
 const STORAGE_KEY = "starkheben5x5";
 const app = document.getElementById("app");
@@ -25,6 +26,8 @@ const ui = {
   progressKey: "squat",
   editorType: "A",
   scheduleDraft: null,
+  crewLift: "squat",
+  crewOpen: null,
 };
 let timer = null; // { start, targets, beeped, missed }
 
@@ -43,9 +46,145 @@ function load() {
   return createState(today);
 }
 
-function save() {
+function saveLocal() {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch { /* private mode */ }
 }
+
+function save() {
+  saveLocal();
+  pushCloud();
+}
+
+// ---------- server sync (Claude artifact db; absent in the APK and local copies) ----------
+// Each person has athletes/<id> (everything but history) and athletes/<id>/sessions/<sessionId>.
+// Everyone reads all athletes; each person writes only their own (see the db rules at publish).
+
+let cloud = null; // { db, user, id }
+const crew = { athletes: {}, sessions: {}, profiles: {}, unsubs: {} };
+const sync = { status: "local", writing: false, dirty: false, readOnly: false, docJson: null, sessionIds: new Set() };
+
+const athleteRef = () => cloud.db.doc(`athletes/${cloud.id}`);
+const sessionsRef = (id = cloud.id) => cloud.db.collection(`athletes/${id}/sessions`);
+
+function setSync(status) {
+  sync.status = status;
+  const el = document.getElementById("sync");
+  if (!el) return;
+  const labels = { loading: "Connecting…", saving: "Saving…", synced: "Saved", error: "Not saved, retrying", readonly: "View only" };
+  el.hidden = status === "local";
+  el.textContent = labels[status] ?? "";
+  el.dataset.status = status;
+}
+
+/** Writes changed documents, one write at a time; changes made meanwhile go out in the next pass. */
+async function pushCloud() {
+  if (!cloud || sync.readOnly) return;
+  if (sync.writing) { sync.dirty = true; return; }
+  sync.writing = true;
+  setSync("saving");
+  try {
+    do {
+      sync.dirty = false;
+      const { doc, sessions } = splitState(state);
+      const ids = new Set(sessions.map((h) => h.id));
+      for (const h of sessions) {
+        if (sync.sessionIds.has(h.id)) continue;
+        await sessionsRef().doc(h.id).set(h);
+        sync.sessionIds.add(h.id);
+      }
+      for (const id of [...sync.sessionIds]) {
+        if (ids.has(id)) continue;
+        await sessionsRef().doc(id).delete();
+        sync.sessionIds.delete(id);
+      }
+      const json = stableStringify(doc);
+      if (json !== sync.docJson) {
+        await athleteRef().set(doc);
+        sync.docJson = json;
+      }
+    } while (sync.dirty);
+    setSync("synced");
+  } catch (e) {
+    if (e?.code === "invalid_argument") {
+      // Not allowed to write here (e.g. shared as Viewer): keep working locally.
+      sync.readOnly = true;
+      setSync("readonly");
+    } else {
+      setSync("error");
+      setTimeout(pushCloud, 5000 + Math.random() * 3000);
+    }
+  } finally {
+    sync.writing = false;
+  }
+}
+
+async function startCloud() {
+  if (typeof window.claude?.use !== "function") return;
+  const [db, user] = await Promise.all([window.claude.use("db"), window.claude.use("user")]);
+  const id = db && user ? await user.id() : null;
+  if (!id) return; // signed out or no server here: stay local
+  cloud = { db, user, id };
+  document.querySelector('.tabs [data-view="crew"]').hidden = false;
+  setSync("loading");
+  try {
+    const [docSnap, sessSnap] = await Promise.all([athleteRef().get(), sessionsRef().get()]);
+    const remote = docSnap.exists ? assembleState(docSnap.data(), sessSnap.docs.map((d) => d.data())) : null;
+    sync.sessionIds = new Set(sessSnap.docs.map((d) => d.id));
+    if (remote) sync.docJson = stableStringify(splitState(remote).doc);
+    state = mergeOnConnect(state, remote);
+    saveLocal();
+    render();
+    await pushCloud(); // uploads anything only this device had
+  } catch {
+    setSync("error");
+  }
+  watchOwnData();
+  watchCrew();
+}
+
+/** Live updates from your other devices. */
+function watchOwnData() {
+  athleteRef().onSnapshot((snap) => {
+    if (!snap.exists || snap.metadata.hasPendingWrites) return;
+    const next = assembleState(snap.data(), state.history);
+    if (!next) return;
+    const json = stableStringify(splitState(next).doc);
+    if (json === sync.docJson || sync.writing) return;
+    sync.docJson = json;
+    state = next;
+    saveLocal();
+    if (!isTyping()) render();
+  }, () => {});
+  sessionsRef().onSnapshot((snap) => {
+    if (snap.metadata.hasPendingWrites || sync.writing) return;
+    const ids = new Set(snap.docs.map((d) => d.id));
+    if (ids.size === sync.sessionIds.size && [...ids].every((id) => sync.sessionIds.has(id))) return;
+    const next = assembleState(splitState(state).doc, snap.docs.map((d) => d.data()));
+    if (!next) return;
+    sync.sessionIds = ids;
+    state = next;
+    saveLocal();
+    if (!isTyping()) render();
+  }, () => {});
+}
+
+/** Everyone's athlete docs, plus each other person's sessions for charts and streaks. */
+function watchCrew() {
+  cloud.db.collection("athletes").onSnapshot((snap) => {
+    crew.athletes = {};
+    for (const d of snap.docs) {
+      crew.athletes[d.id] = d.data();
+      if (d.id === cloud.id || crew.unsubs[d.id]) continue;
+      crew.unsubs[d.id] = sessionsRef(d.id).onSnapshot((s) => {
+        crew.sessions[d.id] = s.docs.map((x) => x.data());
+        if (view === "crew" && !isTyping()) render();
+      }, () => {});
+    }
+    if (view === "crew" && !isTyping()) render();
+  }, () => {});
+}
+
+const isTyping = () => document.activeElement?.matches?.("input, textarea, select") ?? false;
 
 // ---------- helpers ----------
 
@@ -128,8 +267,12 @@ function render() {
     if (b.dataset.view === view) b.setAttribute("aria-current", "page");
     else b.removeAttribute("aria-current");
   }
-  const views = { today: todayView, calendar: calendarView, progress: progressView, program: programView, settings: settingsView };
+  const views = { today: todayView, calendar: calendarView, progress: progressView, crew: crewView, program: programView, settings: settingsView };
   app.innerHTML = views[view]();
+  if (view === "crew") {
+    const members = crewMembers();
+    document.querySelectorAll(".member-name").forEach((el, i) => { el.textContent = members[i] ? memberName(members[i]) : ""; });
+  }
 }
 
 function streakBadge() {
@@ -340,42 +483,58 @@ function niceStep(range) {
   return 200;
 }
 
-function chartSvg(points, title) {
-  if (points.length < 2) return `<p class="muted small">Log at least two sessions to see a graph.</p>`;
+/** Line chart of weight over time. `series`: [{ label, color, points: [{date, weight}] }]; one series gets an area fill and end label. */
+function chartSvg(series, title) {
+  const drawn = series.filter((sr) => sr.points.length);
+  const all = drawn.flatMap((sr) => sr.points);
+  if (!drawn.some((sr) => sr.points.length >= 2)) return `<p class="muted small">Log at least two sessions to see a graph.</p>`;
+  const single = drawn.length === 1;
   const W = 340, H = 190, L = 40, R = 14, T = 14, B = 26;
-  const ws = points.map((p) => p.weight);
-  const ts = points.map((p) => new Date(p.date).getTime());
+  const ws = all.map((p) => p.weight);
+  const ts = all.map((p) => new Date(p.date).getTime());
   const step = niceStep(Math.max(...ws) - Math.min(...ws) || 5);
   const lo = Math.floor(Math.min(...ws) / step) * step;
   const hi = Math.max(lo + step, Math.ceil(Math.max(...ws) / step) * step);
-  const t0 = ts[0], t1 = ts.at(-1) === t0 ? t0 + 1 : ts.at(-1);
+  const t0 = Math.min(...ts), tMax = Math.max(...ts), t1 = tMax === t0 ? t0 + 1 : tMax;
   const x = (t) => L + ((t - t0) / (t1 - t0)) * (W - L - R);
   const y = (w) => T + (1 - (w - lo) / (hi - lo)) * (H - T - B);
   const grid = [];
   for (let v = lo; v <= hi + 1e-9; v += step) {
     grid.push(`<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text class="axis" x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${fmt(v)}</text>`);
   }
-  const d = points.map((p, i) => `${i ? "L" : "M"}${x(ts[i]).toFixed(1)},${y(p.weight).toFixed(1)}`).join(" ");
-  const area = `${d} L${x(ts.at(-1)).toFixed(1)},${H - B} L${x(ts[0]).toFixed(1)},${H - B} Z`;
-  const dots = points.map((p, i) => `<circle class="dot" cx="${x(ts[i]).toFixed(1)}" cy="${y(p.weight).toFixed(1)}" r="${i === points.length - 1 ? 4.5 : 2.5}"/>`).join("");
-  const last = points.at(-1);
-  const lx = Math.min(x(ts.at(-1)), W - R - 2);
-  const short = (iso) => new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short" });
-  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(title)}: ${kg(points[0].weight)} to ${kg(last.weight)} over ${points.length} sessions">
-    ${grid.join("")}
-    <path class="area" d="${area}"/><path class="line" d="${d}"/>${dots}
-    <text class="value" x="${lx}" y="${y(last.weight) - 10}" text-anchor="end">${kg(last.weight)}</text>
-    <text class="axis" x="${L}" y="${H - 6}">${esc(short(points[0].date))}</text>
-    <text class="axis" x="${W - R}" y="${H - 6}" text-anchor="end">${esc(short(last.date))}</text>
-  </svg>`;
+  const marks = drawn.map((sr) => {
+    const pts = sr.points.map((p) => [x(new Date(p.date).getTime()), y(p.weight)]);
+    const d = pts.map(([px, py], i) => `${i ? "L" : "M"}${px.toFixed(1)},${py.toFixed(1)}`).join(" ");
+    const style = `style="--series:${sr.color}"`;
+    const area = single ? `<path class="area" ${style} d="${d} L${pts.at(-1)[0].toFixed(1)},${H - B} L${pts[0][0].toFixed(1)},${H - B} Z"/>` : "";
+    const dots = pts.map(([px, py], i) => `<circle class="dot" ${style} cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="${i === pts.length - 1 ? 4.5 : 2.5}"/>`).join("");
+    return `${area}<path class="line" ${style} d="${d}"/>${dots}`;
+  }).join("");
+  const short = (t) => new Date(t).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+  let endLabel = "";
+  if (single) {
+    const last = drawn[0].points.at(-1);
+    endLabel = `<text class="value" x="${Math.min(x(new Date(last.date).getTime()), W - R - 2)}" y="${y(last.weight) - 10}" text-anchor="end">${kg(last.weight)}</text>`;
+  }
+  const summary = drawn.map((sr) => `${sr.label} ${kg(sr.points[0].weight)} to ${kg(sr.points.at(-1).weight)}`).join("; ");
+  const legend = single ? "" : `<div class="legend small">${drawn.map((sr) =>
+    `<span><span class="swatch" style="--series:${sr.color}"></span>${esc(sr.label)} · ${kg(sr.points.at(-1).weight)}</span>`).join("")}</div>`;
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(title)}: ${esc(summary)}">
+    ${grid.join("")}${marks}${endLabel}
+    <text class="axis" x="${L}" y="${H - 6}">${esc(short(t0))}</text>
+    <text class="axis" x="${W - R}" y="${H - 6}" text-anchor="end">${esc(short(tMax))}</text>
+  </svg>${legend}`;
+}
+
+function liftChips(keys, selected, action) {
+  return keys.map((k) => `<button class="chip" data-action="${action}" data-key="${esc(k)}" aria-pressed="${k === selected}">${esc(LIFTS[k]?.name ?? k)}</button>`).join("");
 }
 
 function progressView() {
   const assistNames = [...new Set(state.history.flatMap((h) => h.exercises.filter((e) => e.type === "assist" && e.weight > 0).map((e) => e.name)))];
   const keys = [...Object.keys(LIFTS), ...assistNames];
   if (!keys.includes(ui.progressKey)) ui.progressKey = "squat";
-  const label = (k) => LIFTS[k]?.name ?? k;
-  const chips = keys.map((k) => `<button class="chip" data-action="progress-key" data-key="${esc(k)}" aria-pressed="${k === ui.progressKey}">${esc(label(k))}</button>`).join("");
+  const label = LIFTS[ui.progressKey]?.name ?? ui.progressKey;
   const points = liftSeries(state.history, ui.progressKey);
   const stats = points.length
     ? `<div class="stats">
@@ -385,8 +544,8 @@ function progressView() {
         <div><span class="small muted">Sessions</span><strong>${points.length}</strong></div>
       </div>` : "";
   return `<div class="row between head"><h2>Progress</h2>${streakBadge()}</div>
-    <div class="chips" role="group" aria-label="Lift">${chips}</div>
-    <div class="card">${chartSvg(points, label(ui.progressKey))}${stats}</div>
+    <div class="chips" role="group" aria-label="Lift">${liftChips(keys, ui.progressKey, "progress-key")}</div>
+    <div class="card">${chartSvg([{ label, color: "var(--accent)", points }], label)}${stats}</div>
     ${standardsSection()}`;
 }
 
@@ -399,9 +558,20 @@ function standardsSection() {
         ${profileFields()}
       </div>`;
   }
+  return `<h2>Strength standards</h2>
+    <div class="card">
+      <p class="small muted">${kg(p.bodyweight)} · ${p.sex === "male" ? "men's" : "women's"} standards. Your estimated 1-rep max is compared with rough bodyweight multiples for Beginner → Novice → Intermediate → Advanced → Elite.</p>
+      ${standardsRows(state)}
+      <details class="small"><summary>Edit bodyweight</summary>${profileFields()}</details>
+    </div>`;
+}
+
+/** Strength-standard rows for anyone's state (needs a bodyweight). */
+function standardsRows(s) {
+  const p = s.profile;
   const rows = Object.keys(LIFTS).map((id) => {
-    const best = bestOneRepMax(state.history, id);
-    const e1rm = best || estimateOneRepMax(state.lifts[id].weight, LIFTS[id].reps);
+    const best = bestOneRepMax(s.history, id);
+    const e1rm = best || estimateOneRepMax(s.lifts[id].weight, LIFTS[id].reps);
     const sp = strengthProgress(e1rm, p.bodyweight, p.sex, id);
     const levels = STANDARDS[p.sex][id];
     const nextText = sp.next
@@ -415,13 +585,90 @@ function standardsSection() {
       <div class="ticks">${ticks}</div>
     </div>`;
   }).join("");
-  return `<h2>Strength standards</h2>
-    <div class="card">
-      <p class="small muted">${kg(p.bodyweight)} · ${p.sex === "male" ? "men's" : "women's"} standards. Your estimated 1-rep max is compared with rough bodyweight multiples for Beginner → Novice → Intermediate → Advanced → Elite.</p>
-      ${rows}
-      ${Object.keys(LIFTS).some((id) => !bestOneRepMax(state.history, id)) ? `<p class="small muted">* Estimated from your working weight until you log a session.</p>` : ""}
-      <details class="small"><summary>Edit bodyweight</summary>${profileFields()}</details>
-    </div>`;
+  const note = Object.keys(LIFTS).some((id) => !bestOneRepMax(s.history, id))
+    ? `<p class="small muted">* Estimated from the working weight until a session is logged.</p>` : "";
+  return rows + note;
+}
+
+// ---------- crew (shared web version only) ----------
+
+const CREW_COLORS = ["#2f6fdf", "#1f8a4c", "#9b51e0", "#d97706", "#0e9aa7"];
+const safeColor = (c) => (typeof c === "string" && /^(#[0-9a-fA-F]{3,8}|(rgb|hsl)a?\([\d\s.,%]+\))$/.test(c) ? c : null);
+
+/** Everyone with a readable athlete document, you first. */
+function crewMembers() {
+  if (!cloud) return [];
+  const members = [{ id: cloud.id, state, me: true }];
+  for (const [aid, doc] of Object.entries(crew.athletes)) {
+    if (aid === cloud.id) continue;
+    const s = assembleState(doc, crew.sessions[aid] ?? []);
+    if (s) members.push({ id: aid, state: s, me: false });
+  }
+  return members;
+}
+
+const memberName = (m) => m.state.profile.nickname || crew.profiles[m.id]?.name || (m.me ? "You" : "Lifter");
+const memberColor = (m, i) => (m.me ? "var(--accent)" : safeColor(crew.profiles[m.id]?.color) ?? CREW_COLORS[i % CREW_COLORS.length]);
+
+function crewView() {
+  if (!cloud) {
+    return `<h2>Crew</h2><div class="card"><p>Open the shared web link while signed in to Claude to see your crew. This copy of the app keeps data on this device only.</p></div>`;
+  }
+  const members = crewMembers();
+  refreshProfiles(members.map((m) => m.id));
+  if (!Object.keys(LIFTS).includes(ui.crewLift)) ui.crewLift = "squat";
+  const series = members.map((m, i) => ({
+    label: `${memberName(m)}${m.me ? " (you)" : ""}`,
+    color: memberColor(m, i),
+    points: liftSeries(m.state.history, ui.crewLift),
+  }));
+  const alone = members.length < 2
+    ? `<div class="card"><p class="small">Nobody else has opened the app yet. Share this page with your training partner as an <strong>Editor</strong> (Share menu → invite by email). Once they've opened it, they show up here.</p></div>` : "";
+  return `<div class="row between head"><h2>Crew</h2></div>
+    ${alone}
+    <div class="chips" role="group" aria-label="Lift">${liftChips(Object.keys(LIFTS), ui.crewLift, "crew-lift")}</div>
+    <div class="card">${chartSvg(series, `${LIFTS[ui.crewLift].name} working weight`)}</div>
+    ${members.map((m, i) => memberCard(m, i)).join("")}`;
+}
+
+function memberCard(m, i) {
+  const s = m.state;
+  const today = todayKey();
+  const weeks = streakWeeks(s, today);
+  const last = s.history[0];
+  const next = upcoming(s, today, addDays(today, 30))[0];
+  const p = crew.profiles[m.id];
+  const avatar = p?.avatarUrl ? `<img class="avatar" src="${esc(p.avatarUrl)}" alt="">` : `<span class="avatar" style="--series:${memberColor(m, i)}"></span>`;
+  const weights = Object.keys(LIFTS).map((id) => `<div class="line">
+      <span>${esc(LIFTS[id].name)}${s.lifts[id].failures ? ` <span class="tag repeat">${s.lifts[id].failures}× missed</span>` : ""}</span>
+      <strong>${kg(s.lifts[id].weight)}</strong></div>`).join("");
+  const open = ui.crewOpen === m.id;
+  const details = open
+    ? (s.profile.bodyweight
+      ? `<h3>Strength standards · ${kg(s.profile.bodyweight)}</h3>${standardsRows(s)}`
+      : `<p class="small muted">${m.me ? "Add your" : "No"} bodyweight${m.me ? " on the Progress tab" : " entered yet"}, so no strength standards.</p>`)
+    : "";
+  return `<div class="card member">
+    <div class="row between">
+      <div class="row">${avatar}<div><strong class="member-name"></strong>${m.me ? ` <span class="muted small">you</span>` : ""}
+        <div class="small muted">${last ? `Last: ${esc(isoDayLabel(last.date))} · Workout ${esc(last.type)}` : "No workouts yet"}${next ? ` · Next: ${esc(dayLabel(next.date))}` : ""}</div></div></div>
+      <span class="streak ${weeks ? "on" : ""}">${FLAME}${weeks}</span>
+    </div>
+    <h3>Working weights</h3>
+    ${weights}
+    <div class="row between small muted"><span>${s.history.length} workout${s.history.length === 1 ? "" : "s"} logged</span>
+      <button class="btn link small" data-action="crew-open" data-member="${esc(m.id)}">${open ? "Hide standards" : "Strength standards"}</button></div>
+    ${details}
+  </div>`;
+}
+
+function refreshProfiles(ids) {
+  if (!cloud?.user) return;
+  cloud.user.profiles(ids).then((ps) => {
+    const before = JSON.stringify(crew.profiles);
+    for (const id of ids) crew.profiles[id] = { name: ps[id]?.name || "", color: ps[id]?.color || "", avatarUrl: ps[id]?.avatarUrl || "" };
+    if (JSON.stringify(crew.profiles) !== before && view === "crew") render();
+  });
 }
 
 function profileFields() {
@@ -524,6 +771,7 @@ function settingsView() {
   return `<h2>Settings</h2>
     <form class="card" id="settings">
       <h3>You</h3>
+      <label class="field wide"><span>Name for your crew</span><input type="text" id="profile-nickname" data-input="profile-nickname" maxlength="30" value="${esc(state.profile.nickname ?? "")}" placeholder="e.g. Mathias"></label>
       ${profileFields()}
       <h3>Working weights (kg)</h3>
       ${Object.keys(LIFTS).map((id) => field(LIFTS[id].name, `weight.${id}`, state.lifts[id].weight, `min="0" step="${step}"`)).join("")}
@@ -576,6 +824,7 @@ document.querySelector(".tabs").addEventListener("click", (e) => {
 const actions = {
   start(el) {
     state.active = startWorkout(state, el.dataset.type);
+    state.active.id += `-${newId()}`; // unique across devices, since it's also the session's storage key
     ui.summary = null;
     ui.chosenType = null;
     ui.plates.clear();
@@ -636,6 +885,8 @@ const actions = {
     ui.calSelected = original;
   },
   "progress-key"(el) { ui.progressKey = el.dataset.key; },
+  "crew-lift"(el) { ui.crewLift = el.dataset.key; },
+  "crew-open"(el) { ui.crewOpen = ui.crewOpen === el.dataset.member ? null : el.dataset.member; },
   "schedule-mode"(el) { ui.scheduleDraft.mode = el.dataset.mode; },
   "toggle-day"(el) {
     const wd = Number(el.dataset.wd);
@@ -717,6 +968,8 @@ document.addEventListener("change", async (e) => {
   } else if (input === "profile-bodyweight") {
     const n = Number(t.value);
     state.profile.bodyweight = t.value === "" ? null : n >= 20 && n <= 400 ? Math.round(n * 10) / 10 : state.profile.bodyweight;
+  } else if (input === "profile-nickname") {
+    state.profile.nickname = t.value.trim().slice(0, 30);
   } else if (input === "profile-sex") {
     state.profile.sex = t.value === "female" ? "female" : "male";
   } else if (input === "fixed-day") {
@@ -815,3 +1068,4 @@ if ("serviceWorker" in navigator) {
 }
 
 render();
+startCloud();

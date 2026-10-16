@@ -31,6 +31,18 @@ All weights are in kg. All the numbers above can be changed in Settings.
 - **Strength standards:** enter bodyweight and sex. For each lift, the app compares your estimated 1-rep max with bodyweight-multiple milestones (Beginner → Novice → Intermediate → Advanced → Elite) and shows the % reached toward the next one. These standards are rough guides.
 - **Backup:** copy/paste JSON backup and restore. Data saved by older versions, including lb data, is upgraded automatically.
 
+## Shared web version (you and your training partners)
+
+The app runs as a Claude artifact. Data is stored on claude.ai's servers and synced live between devices, and everyone signs in with their own Claude account. There is no separate login.
+
+- **Storage:** each person has one document (`athletes/<id>`, holding settings, weights, schedule and any in-progress workout) plus one document per finished workout (`athletes/<id>/sessions/<sessionId>`).
+- **Access rules (set when publishing):** everyone who can open the page reads every athlete; each person writes only their own documents.
+- **Crew tab:** shows everyone's working weights, streaks, last and next workout, strength standards, and a chart comparing one lift across the group.
+- **Inviting someone:** the owner opens the page's Share menu, invites the partner by email as an **Editor**, and leaves link sharing off. Anyone with view-only access can still look at the crew but can't save, and the header shows "View only".
+- **First connection:** on the first connection from a device, workouts saved only on that device are merged into the server copy.
+
+Outside claude.ai (the APK or a local copy), `window.claude` doesn't exist. The app then runs as before, with data kept in the browser on that device, and the Crew tab stays hidden.
+
 ## Run it
 
 Any static file server works. The service worker needs `http://localhost` or HTTPS.
@@ -58,6 +70,7 @@ The first build creates a local signing key, `android/debug.keystore` (not commi
 - `src/program.js`: program logic (progression, deloads, set schemes, templates, plates, warm-ups, data migration and validation)
 - `src/schedule.js`: schedules, calendar, rescheduling and streaks
 - `src/standards.js`: strength standards and 1RM estimates
+- `src/sync.js`: mapping state to server documents and merging copies
 - `src/app.js`: UI, storage and rest timer
 - `tests/`: unit tests for the logic modules
 - `sw.js`, `manifest.webmanifest`, `icon.svg`: offline and install support

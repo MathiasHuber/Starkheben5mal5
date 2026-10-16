@@ -13,7 +13,7 @@ const standalone = args.includes("--standalone");
 const out = args.find((a) => !a.startsWith("--")) ?? join(root, "dist", "starkheben-5x5.html");
 
 // Modules in dependency order; their local imports and exports are stripped so they share one scope.
-const MODULES = ["src/schedule.js", "src/standards.js", "src/program.js", "src/app.js"];
+const MODULES = ["src/schedule.js", "src/standards.js", "src/program.js", "src/sync.js", "src/app.js"];
 const scripts = MODULES.map((m) => {
   const code = read(m)
     .replace(/^import \{[\s\S]*?\} from "\.\/[\w-]+\.js";\n/gm, "")

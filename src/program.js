@@ -49,7 +49,7 @@ export function createState(today) {
   return {
     version: 2,
     settings: defaultSettings(),
-    profile: { bodyweight: null, sex: "male" },
+    profile: { bodyweight: null, sex: "male", nickname: "" },
     lifts,
     templates: defaultTemplates(),
     schedules: [defaultSchedule(today)],
@@ -277,7 +277,7 @@ function migrateV1(v1, today) {
   return {
     version: 2,
     settings,
-    profile: { bodyweight: null, sex: "male" },
+    profile: { bodyweight: null, sex: "male", nickname: "" },
     lifts,
     templates: defaultTemplates(),
     schedules: [defaultSchedule(today)],
@@ -299,9 +299,9 @@ function validExercise(ex) {
   return false;
 }
 
-/** Checks an in-progress or finished session. */
+/** Checks an in-progress or finished session. Its id doubles as a storage key, so it's restricted. */
 export function validateSession(s) {
-  return Boolean(s) && isType(s.type) && typeof s.date === "string" && Array.isArray(s.exercises) && s.exercises.every(validExercise);
+  return Boolean(s) && typeof s.id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(s.id) && isType(s.type) && typeof s.date === "string" && Array.isArray(s.exercises) && s.exercises.every(validExercise);
 }
 
 function validTemplateItem(t) {
@@ -328,6 +328,7 @@ export function validateState(data) {
   }
   const p = data.profile;
   if (!p || !(p.bodyweight === null || (num(p.bodyweight) && p.bodyweight > 0)) || !["male", "female"].includes(p.sex)) return null;
+  if (!(p.nickname === undefined || (typeof p.nickname === "string" && p.nickname.length <= 30))) return null;
   if (!data.templates || !["A", "B"].every((t) => Array.isArray(data.templates[t]) && data.templates[t].every(validTemplateItem))) return null;
   if (!Array.isArray(data.schedules) || !data.schedules.length || !data.schedules.every(validSchedule)) return null;
   if (!data.overrides || typeof data.overrides !== "object" || !Object.entries(data.overrides).every(([k, v]) => isDateKey(k) && isDateKey(v))) return null;
