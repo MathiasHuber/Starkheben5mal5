@@ -222,11 +222,20 @@ function settingsView() {
     </form>
     <h2>Data</h2>
     <div class="card row wrap">
-      <button class="btn" data-action="export">Export backup</button>
-      <label class="btn">Import backup<input type="file" accept="application/json" id="import" hidden></label>
+      <button class="btn" data-action="export">Show backup</button>
       <button class="btn" data-action="reset">Reset everything</button>
     </div>
-    <p class="muted small">Your data stays in this browser. Export a backup before clearing site data.</p>`;
+    <div class="card" id="backup-panel" hidden>
+      <label for="backup" class="small muted">Backup text. Copy it somewhere safe, or paste a backup here and restore it.</label>
+      <textarea id="backup" rows="6" spellcheck="false"></textarea>
+      <div class="row wrap">
+        <button class="btn" data-action="copy-backup">Copy</button>
+        <label class="btn">Load file<input type="file" accept="application/json,.json,.txt" id="import" hidden></label>
+        <button class="btn primary" data-action="restore">Restore</button>
+      </div>
+      <p class="small muted" id="backup-status" role="status"></p>
+    </div>
+    <p class="muted small">Your data stays in this browser. Save a backup before clearing site data.</p>`;
 }
 
 // ---------- events ----------
@@ -239,7 +248,7 @@ document.querySelector(".tabs").addEventListener("click", (e) => {
   window.scrollTo(0, 0);
 });
 
-document.addEventListener("click", (e) => {
+document.addEventListener("click", async (e) => {
   const el = e.target.closest("[data-action]");
   if (!el) return;
   const i = Number(el.dataset.ex);
@@ -270,22 +279,24 @@ document.addEventListener("click", (e) => {
     case "warmups": toggle(open.warmups); break;
     case "finish": {
       const unlogged = state.active.exercises.filter((ex) => exerciseResult(ex) !== "success" && ex.sets.some((r) => r === null));
-      if (unlogged.length && !confirm("Some sets aren't logged. Unlogged sets count as missed. Finish anyway?")) return;
+      if (unlogged.length && !(await ask("Some sets aren't logged. Unlogged sets count as missed. Finish anyway?", "Finish"))) return;
       state = finishWorkout(state, state.active);
       summary = state.history[0];
       stopTimer();
       break;
     }
     case "cancel":
-      if (!confirm("Discard this workout? Nothing will be saved.")) return;
+      if (!(await ask("Discard this workout? Nothing will be saved.", "Discard"))) return;
       state.active = null;
       stopTimer();
       break;
     case "dismiss-summary": summary = null; break;
     case "stop-timer": stopTimer(); return;
-    case "export": exportData(); return;
+    case "export": showBackup(); return;
+    case "copy-backup": copyBackup(); return;
+    case "restore": restoreBackup(); return;
     case "reset":
-      if (!confirm("Delete all workouts and settings?")) return;
+      if (!(await ask("Delete all workouts and settings? This can't be undone.", "Delete everything"))) return;
       state = createState(state.settings.unit);
       summary = null;
       stopTimer();
@@ -297,7 +308,7 @@ document.addEventListener("click", (e) => {
 });
 
 document.addEventListener("change", async (e) => {
-  if (e.target.id === "import") return importData(e.target.files[0]);
+  if (e.target.id === "import") return loadBackupFile(e.target.files[0]);
   const form = e.target.closest("#settings");
   if (!form) return;
   const { name, value } = e.target;
@@ -317,28 +328,66 @@ document.addEventListener("change", async (e) => {
   render();
 });
 
-function exportData() {
-  const blob = new Blob([JSON.stringify({ ...state, active: null }, null, 2)], { type: "application/json" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `starkheben-5x5-${new Date().toISOString().slice(0, 10)}.json`;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+// Backups go through a text box: downloads and file saves are blocked in some embedded views.
+function backupStatus(msg) {
+  const el = document.getElementById("backup-status");
+  if (el) el.textContent = msg;
 }
 
-async function importData(file) {
-  if (!file) return;
+function showBackup() {
+  document.getElementById("backup-panel").hidden = false;
+  document.getElementById("backup").value = JSON.stringify({ ...state, active: null });
+  backupStatus(`Backup of ${state.history.length} workouts.`);
+}
+
+async function copyBackup() {
+  const box = document.getElementById("backup");
   try {
-    const data = validateState(JSON.parse(await file.text()));
-    if (!data) throw new Error("invalid");
-    if (!confirm(`Replace current data with this backup (${data.history.length} workouts)?`)) return;
-    state = data;
-    summary = null;
-    save();
-    render();
+    await navigator.clipboard.writeText(box.value);
+    backupStatus("Copied.");
   } catch {
-    alert("That file isn't a valid backup.");
+    box.focus();
+    box.select();
+    backupStatus("Selected. Use your device's Copy.");
   }
+}
+
+async function loadBackupFile(file) {
+  if (!file) return;
+  document.getElementById("backup").value = await file.text();
+  backupStatus("File loaded. Tap Restore to use it.");
+}
+
+async function restoreBackup() {
+  let data = null;
+  try { data = validateState(JSON.parse(document.getElementById("backup").value)); } catch { /* handled below */ }
+  if (!data) return backupStatus("That isn't a valid backup. Paste the full text from Show backup.");
+  if (!(await ask(`Replace current data with this backup (${data.history.length} workouts)?`, "Replace"))) return;
+  state = data;
+  summary = null;
+  save();
+  render();
+}
+
+// In-page confirmation: native confirm() is unavailable in some embedded views.
+function ask(message, okLabel) {
+  const modal = document.getElementById("modal");
+  const ok = document.getElementById("modal-ok");
+  const cancel = document.getElementById("modal-cancel");
+  document.getElementById("modal-text").textContent = message;
+  ok.textContent = okLabel;
+  modal.hidden = false;
+  cancel.focus();
+  return new Promise((resolve) => {
+    const done = (value) => {
+      modal.hidden = true;
+      ok.onclick = cancel.onclick = modal.onkeydown = null;
+      resolve(value);
+    };
+    ok.onclick = () => done(true);
+    cancel.onclick = () => done(false);
+    modal.onkeydown = (ev) => ev.key === "Escape" && done(false);
+  });
 }
 
 if ("serviceWorker" in navigator) {

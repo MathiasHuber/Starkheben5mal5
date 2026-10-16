@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "start": "npx -y serve@14.2.4 -l 8080 ."
+    "start": "npx -y serve@14.2.4 -l 8080 .",
+    "build:single": "node scripts/build-single.mjs"
   }
 }
