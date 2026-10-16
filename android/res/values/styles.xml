@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Light theme; values-night overrides it so the page's prefers-color-scheme follows the system. -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#f4f5f7</item>
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
+</resources>
