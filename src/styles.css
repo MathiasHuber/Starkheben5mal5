@@ -281,3 +281,11 @@ details summary { cursor: pointer; padding: 8px 0; color: var(--muted); }
 .login .field { text-align: left; grid-template-columns: 1fr; gap: 4px; padding: 0; }
 .login .field input { min-height: 44px; font-size: 1rem; }
 .tabs[hidden] { display: none; }
+
+/* data + past workouts */
+.data details { margin-top: 6px; }
+.data textarea { margin-top: 6px; }
+.add-past { margin-top: 12px; }
+.plan .line.small { padding: 2px 0; }
+.stats strong { white-space: nowrap; }
+@media (max-width: 420px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 12px; } }

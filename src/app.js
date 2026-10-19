@@ -1,7 +1,7 @@
 import {
   LIFTS, ASSISTANCE, createState, startWorkout, finishWorkout, cycleSet, exerciseResult, targetsFor,
   platesPerSide, warmupSets, restTargets, migrate, validateSession, loadStep, deloadLift, suggestDeload,
-  moveItem, bestOneRepMax, liftSeries,
+  moveItem, bestOneRepMax, liftSeries, manualDraft, addManualWorkout, deleteWorkout, makeBackup, readBackup,
 } from "./program.js";
 import {
   WEEKDAY_NAMES, WEEK_ORDER, todayKey, toKey, fromKey, addDays, weekStart, occurrences, upcoming,
@@ -30,6 +30,8 @@ const ui = {
   scheduleDraft: null,
   crewLift: "squat",
   loginMode: "signin",
+  manual: null, // a past workout being filled in
+  flash: "", // one-off message for the settings page
   crewOpen: null,
 };
 let timer = null; // { start, targets, beeped, missed }
@@ -262,6 +264,7 @@ const dayLabel = (key) => fromKey(key).toLocaleDateString(undefined, { weekday: 
 const isoDayLabel = (iso) => dayLabel(toKey(new Date(iso)));
 const exName = (ex) => (ex.type === "main" ? LIFTS[ex.liftId].name : ex.name);
 const newId = () => Math.random().toString(36).slice(2, 10);
+const workouts = (n) => `${n} workout${n === 1 ? "" : "s"}`;
 
 function platesText(weight) {
   const { plates, remainder } = platesPerSide(weight, state.settings);
@@ -334,7 +337,7 @@ function render() {
     else b.removeAttribute("aria-current");
   }
   const views = { today: todayView, calendar: calendarView, progress: progressView, crew: crewView, program: programView, settings: settingsView,
-    login: loginView };
+    login: loginView, manual: manualView };
   document.querySelector(".tabs").hidden = view === "login";
   app.innerHTML = views[view]();
   if (view === "crew") {
@@ -404,7 +407,7 @@ function summaryCard(s) {
     <button class="btn link" data-action="dismiss-summary">Close</button></div>${rows}</div>`;
 }
 
-function setCircles(ex, i) {
+function setCircles(ex, i, action = "set") {
   const targets = targetsFor(ex, state.settings);
   const unit = ex.type === "assist" ? ex.unit : "reps";
   const groups = [];
@@ -413,7 +416,7 @@ function setCircles(ex, i) {
     const cls = r === null ? "" : r >= t.reps ? "done" : "miss";
     const label = unit === "sec" ? (r === null ? "" : `${r}s`) : r === null ? "" : r;
     const aria = `${exName(ex)} set ${j + 1}${t.top ? " (top set)" : ""}: ${r === null ? "not done" : `${r} ${unit === "sec" ? "seconds" : "reps"}`}`;
-    groups.push(`<button class="set ${cls} ${t.top ? "top" : ""}" data-action="set" data-ex="${i}" data-set="${j}" aria-label="${esc(aria)}">${esc(label)}</button>`);
+    groups.push(`<button class="set ${cls} ${t.top ? "top" : ""}" data-action="${action}" data-ex="${i}" data-set="${j}" aria-label="${esc(aria)}">${esc(label)}</button>`);
   });
   if (ex.type === "main" && ex.scheme === "topBackoff") {
     const back = targets[1];
@@ -465,6 +468,30 @@ function activeView(session) {
     ${cards}
     <button class="btn primary block" data-action="finish">Finish workout</button>
     <div class="center"><button class="btn link" data-action="cancel">Discard workout</button></div>`;
+}
+
+// ---------- adding a past workout ----------
+
+function manualView() {
+  const m = ui.manual;
+  const day = toKey(new Date(m.date));
+  const cards = m.exercises.map((ex, i) => `<div class="card">
+    <div class="row between wrap">
+      <div class="lift-name">${esc(exName(ex))} <span class="muted small">${esc(itemSummary(ex))}</span></div>
+      <label class="inline small muted">Weight
+        <input type="number" inputmode="decimal" min="0" step="0.5" id="manual-weight-${i}" data-input="manual-weight" data-ex="${i}" value="${fmt(ex.weight)}"> kg</label>
+    </div>
+    ${setCircles(ex, i, "manual-set")}
+  </div>`).join("");
+  return `<h2>Add a workout <span class="muted small">${esc(dayLabel(day))}</span></h2>
+    <div class="seg" role="group" aria-label="Workout">
+      <button data-action="manual-type" data-type="A" aria-pressed="${m.type === "A"}">Workout A</button>
+      <button data-action="manual-type" data-type="B" aria-pressed="${m.type === "B"}">Workout B</button>
+    </div>
+    <p class="small muted">Sets start as done. Tap one to lower its reps, or tap through to clear it. Your current working weights stay as they are.</p>
+    ${cards}
+    <button class="btn primary block" data-action="manual-save">Save workout</button>
+    <div class="center"><button class="btn link" data-action="manual-cancel">Cancel</button></div>`;
 }
 
 // ---------- calendar ----------
@@ -523,8 +550,12 @@ function calendarView() {
 function dayDetail(k, today, types, doneOn) {
   const done = doneOn[k] ?? [];
   const plans = occurrences(state, k, k);
-  const doneRows = done.map((h) => `<div class="line"><span><span class="mark done">${esc(h.type)}</span> Workout ${esc(h.type)} done</span>
-    <span class="muted small">${h.exercises.filter((e) => e.type === "main").map((e) => esc(LIFTS[e.liftId].name)).join(", ")}</span></div>`).join("");
+  const doneRows = done.map((h) => `<div class="plan">
+    <div class="line"><span><span class="mark done">${esc(h.type)}</span> Workout ${esc(h.type)}${h.manual ? ` <span class="tag none">added</span>` : ""}</span>
+      <button class="btn small" data-action="delete-workout" data-id="${esc(h.id)}">Delete</button></div>
+    ${h.exercises.map((e) => `<div class="line small"><span>${esc(exName(e))}</span>
+      <span class="muted nowrap">${kg(e.weight)} · ${e.log.map((r) => (r === null ? "–" : r)).join("/")}</span></div>`).join("")}
+  </div>`).join("");
   const planRows = plans.map((o) => {
     const t = types[`${o.original}>${o.date}`];
     // Past: only unmatched sessions are missed. Today/future: sessions without a type were already trained.
@@ -541,7 +572,9 @@ function dayDetail(k, today, types, doneOn) {
     </div>`;
   }).join("");
   const body = doneRows + planRows || `<p class="muted small">Nothing planned. Your weekly schedule is set in Program.</p>`;
-  return `<div class="card"><strong>${esc(dayLabel(k))}</strong>${body}</div>`;
+  const add = k <= today
+    ? `<button class="btn block add-past" data-action="manual-start" data-date="${k}">+ Add a workout on this day</button>` : "";
+  return `<div class="card"><strong>${esc(dayLabel(k))}</strong>${body}${add}</div>`;
 }
 
 // ---------- progress ----------
@@ -900,7 +933,7 @@ function settingsView() {
     ${accountCard()}
     <form class="card" id="settings">
       <h3>You</h3>
-      <label class="field wide"><span>Name for your crew</span><input type="text" id="profile-nickname" data-input="profile-nickname" maxlength="30" value="${esc(state.profile.nickname ?? "")}" placeholder="e.g. Mathias"></label>
+      ${rpc || window.claude ? `<label class="field wide"><span>Name for your crew</span><input type="text" id="profile-nickname" data-input="profile-nickname" maxlength="30" value="${esc(state.profile.nickname ?? "")}" placeholder="e.g. Mathias"></label>` : ""}
       ${profileFields()}
       <h3>Working weights (kg)</h3>
       ${Object.keys(LIFTS).map((id) => field(LIFTS[id].name, `weight.${id}`, state.lifts[id].weight, `min="0" step="${step}"`)).join("")}
@@ -921,22 +954,27 @@ function settingsView() {
       ${field("Bar weight (kg)", "bar", s.bar, `min="0" step="0.5"`)}
       <p class="muted small">Plates: ${s.plates.map(fmt).join(", ")} kg. Deloads and back-off sets round down to ${kg(step)} steps.</p>
     </form>
-    <h2>Data</h2>
-    <div class="card row wrap">
-      <button class="btn" data-action="export">Show backup</button>
-      <button class="btn" data-action="reset">Reset everything</button>
-    </div>
-    <div class="card" id="backup-panel" hidden>
-      <label for="backup" class="small muted">Backup text. Copy it somewhere safe, or paste a backup here and restore it.</label>
-      <textarea id="backup" rows="6" spellcheck="false"></textarea>
+    <h2>Your data</h2>
+    <div class="card data">
+      <p class="small">Export saves all your workouts, weights and settings to a file. Import replaces everything ${cloud ? "in your account" : "in this app"} with a file's contents. Use them to move between the web app and the Android app.</p>
       <div class="row wrap">
-        <button class="btn" data-action="copy-backup">Copy</button>
-        <label class="btn">Load file<input type="file" accept="application/json,.json,.txt" id="import" hidden></label>
-        <button class="btn primary" data-action="restore">Restore</button>
+        <button class="btn" data-action="export-file">Export data</button>
+        <label class="btn">Import data<input type="file" accept="application/json,.json,text/plain" id="import" hidden></label>
       </div>
-      <p class="small muted" id="backup-status" role="status"></p>
+      <p class="small" id="backup-status" role="status">${esc(ui.flash)}</p>
+      <details id="backup-paste">
+        <summary class="small">Copy and paste instead</summary>
+        <textarea id="backup" rows="5" spellcheck="false" aria-label="Exported data"></textarea>
+        <div class="row wrap">
+          <button class="btn small" data-action="copy-backup">Copy my data</button>
+          <button class="btn small" data-action="import-text">Import pasted text</button>
+        </div>
+      </details>
     </div>
-    <p class="muted small">Your data stays on this device. Save a backup before clearing app data.</p>`;
+    <div class="card row between wrap">
+      <span class="small muted">${cloud ? "Your data is saved to your account." : "Your data is saved on this device only. Export it now and then."}</span>
+      <button class="btn small" data-action="reset">Reset everything</button>
+    </div>`;
 }
 
 // ---------- events ----------
@@ -946,6 +984,7 @@ document.querySelector(".tabs").addEventListener("click", (e) => {
   if (!b) return;
   view = b.dataset.view;
   ui.scheduleDraft = null;
+  ui.flash = "";
   render();
   window.scrollTo(0, 0);
 });
@@ -1076,9 +1115,36 @@ const actions = {
     }
     state.templates[t] = [...state.templates[t], { type: "assist", id: newId(), ...item, weight: 0 }];
   },
-  export() { showBackup(); return false; },
+  "export-file"() { exportData(); return false; },
   "copy-backup"() { copyBackup(); return false; },
-  restore() { restoreBackup(); return false; },
+  "import-text"() { importText(document.getElementById("backup").value); return false; },
+  "manual-start"(el) {
+    const [y, mo, d] = el.dataset.date.split("-").map(Number);
+    ui.manual = manualDraft(state, state.nextWorkout === "A" ? "B" : "A", new Date(y, mo - 1, d, 12).toISOString());
+    view = "manual";
+    window.scrollTo(0, 0);
+  },
+  "manual-type"(el) { ui.manual = manualDraft(state, el.dataset.type, ui.manual.date); },
+  "manual-set"(el) {
+    const ex = ui.manual.exercises[Number(el.dataset.ex)];
+    const j = Number(el.dataset.set);
+    ex.log[j] = cycleSet(ex.log[j], targetsFor(ex, state.settings)[j].reps, ex.type === "assist" ? ex.unit : "reps");
+  },
+  "manual-save"() {
+    if (ui.manual.exercises.every((ex) => ex.log.every((r) => r === null))) return false;
+    const day = toKey(new Date(ui.manual.date));
+    state = addManualWorkout(state, ui.manual, `${Date.now()}-${newId()}`);
+    ui.manual = null;
+    ui.calSelected = day;
+    ui.calMonth = day.slice(0, 7);
+    view = "calendar";
+  },
+  "manual-cancel"() { ui.manual = null; view = "calendar"; },
+  async "delete-workout"(el) {
+    const h = state.history.find((x) => x.id === el.dataset.id);
+    if (!h || !(await ask(`Delete workout ${h.type} from ${isoDayLabel(h.date)}? It disappears from your history and graphs.`, "Delete"))) return false;
+    state = deleteWorkout(state, h.id);
+  },
   async reset() {
     if (!(await ask("Delete all workouts and settings? This can't be undone.", "Delete everything"))) return false;
     state = createState(todayKey());
@@ -1103,12 +1169,21 @@ document.addEventListener("click", async (e) => {
 
 document.addEventListener("change", async (e) => {
   const t = e.target;
-  if (t.id === "import") return loadBackupFile(t.files[0]);
+  if (t.id === "import") {
+    const file = t.files[0];
+    t.value = ""; // so picking the same file again still triggers an import
+    return file && importText(await file.text());
+  }
   if (t.id === "add-assist") {
     document.getElementById("custom-assist").hidden = t.value !== "custom";
     return;
   }
   const input = t.dataset.input;
+  if (input === "manual-weight") {
+    const n = Number(t.value);
+    if (Number.isFinite(n) && n >= 0 && n <= 1000) ui.manual.exercises[Number(t.dataset.ex)].weight = n;
+    return render();
+  }
   if (input === "assist-weight") {
     const n = Number(t.value);
     if (Number.isFinite(n) && n >= 0) state.active.exercises[Number(t.dataset.ex)].weight = n;
@@ -1151,20 +1226,45 @@ document.addEventListener("submit", (e) => {
   if (e.target.id === "login-form") submitLogin();
 });
 
-// Backups go through a text box: downloads and file saves are blocked in some embedded views.
+// ---------- export / import ----------
+// One file format everywhere. Exports download as a file on the web, go through Android's save dialog
+// in the app, and fall back to copy/paste on the Claude page, where downloads are blocked.
+
 function backupStatus(msg) {
+  ui.flash = msg;
   const el = document.getElementById("backup-status");
   if (el) el.textContent = msg;
 }
 
-function showBackup() {
-  document.getElementById("backup-panel").hidden = false;
-  document.getElementById("backup").value = JSON.stringify({ ...state, active: null });
-  backupStatus(`Backup of ${state.history.length} workouts.`);
+function exportData() {
+  const text = JSON.stringify(makeBackup(state));
+  const name = `starkheben-5x5-${todayKey()}.json`;
+  const count = workouts(state.history.length);
+  if (window.StarkhebenAndroid?.exportFile) {
+    window.StarkhebenAndroid.exportFile(name, text);
+    return backupStatus("Choose where to save the file.");
+  }
+  if (window.claude) {
+    document.getElementById("backup-paste").open = true;
+    document.getElementById("backup").value = text;
+    return backupStatus(`Downloads aren't available here. Copy the text below (${count}) and keep it somewhere safe.`);
+  }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+  a.download = name;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  backupStatus(`Exported ${count} to ${name}.`);
 }
+
+// Called by the Android app once the save dialog finishes.
+window.onAndroidExport = (ok) => backupStatus(ok ? "Exported. The file is where you chose to save it." : "Export cancelled.");
 
 async function copyBackup() {
   const box = document.getElementById("backup");
+  if (!box.value) box.value = JSON.stringify(makeBackup(state));
   try {
     await navigator.clipboard.writeText(box.value);
     backupStatus("Copied.");
@@ -1175,19 +1275,21 @@ async function copyBackup() {
   }
 }
 
-async function loadBackupFile(file) {
-  if (!file) return;
-  document.getElementById("backup").value = await file.text();
-  backupStatus("File loaded. Tap Restore to use it.");
-}
-
-async function restoreBackup() {
-  let data = null;
-  try { data = migrate(JSON.parse(document.getElementById("backup").value), todayKey()); } catch { /* handled below */ }
-  if (!data) return backupStatus("That isn't a valid backup. Paste the full text from Show backup.");
-  if (!(await ask(`Replace current data with this backup (${data.history.length} workouts)?`, "Replace"))) return;
+/** Import always replaces everything, so it asks first and says exactly what will be lost. */
+async function importText(text) {
+  const data = readBackup(text, todayKey());
+  if (!data) return backupStatus("That isn't a Starkheben export. Nothing was changed.");
+  const where = cloud ? "your account (on all your devices)" : "this app";
+  const ok = await ask(
+    `Replace ALL data in ${where}? Your ${workouts(state.history.length)}, working weights, schedule and settings will be overwritten by the file's ${workouts(data.history.length)}. This can't be undone. Export your current data first if you might need it.`,
+    "Replace my data",
+  );
+  if (!ok) return backupStatus("Import cancelled. Nothing was changed.");
   state = data;
   ui.summary = null;
+  ui.manual = null;
+  stopTimer();
+  ui.flash = `Imported ${workouts(data.history.length)}.`;
   save();
   render();
 }

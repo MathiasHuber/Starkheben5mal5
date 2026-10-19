@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Match the page background (the bg color token in src/styles.css) so the system bars blend in. -->
+    <color name="app_bg">#f4f5f7</color>
+    <color name="icon_bg">#14161a</color>
+</resources>

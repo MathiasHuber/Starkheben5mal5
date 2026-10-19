@@ -37,4 +37,4 @@ Open the page, tap **New here? Create an account**, and send your partner the li
 - **Free-tier pause.** Supabase pauses a free project after about a week without use. Training a few times a week keeps it awake. If it does pause, open the Supabase dashboard and click **Restore**. No data is lost.
 - **Update speed.** Changes from other people or devices show up within about 15 seconds, and right away when you switch back to the app.
 - **Existing data.** Workouts saved on a device before signing in are added to your account the first time you sign in there.
-- **The Android APK** uses the same accounts and syncs too. Without a connection it keeps working and syncs later.
+- **The Android app is device-only.** It has no accounts and no Crew tab, and keeps its data on the phone. Use Settings → Export / Import data to move data between it and the web version.

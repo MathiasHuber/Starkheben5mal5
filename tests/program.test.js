@@ -187,3 +187,46 @@ test("validation accepts real state and rejects junk", () => {
   assert.equal(validateState({ ...s, overrides: { "2026-10-12": "tomorrow" } }), null);
   assert.equal(validateState({ ...s, templates: { ...s.templates, A: [{ type: "main", liftId: "curl", scheme: "straight" }] } }), null);
 });
+
+test("manual workouts: past day, weights of that day, history only", async () => {
+  const { manualDraft, addManualWorkout, deleteWorkout, weightOn } = await import("../src/program.js");
+  let s = createState(TODAY);
+  s = finishWorkout(s, logAll(startWorkout(s, "A", Date.UTC(2026, 9, 12, 8)), s.settings), Date.UTC(2026, 9, 12, 9));
+  s = finishWorkout(s, logAll(startWorkout(s, "B", Date.UTC(2026, 9, 14, 8)), s.settings), Date.UTC(2026, 9, 14, 9));
+  const before = { lifts: JSON.stringify(s.lifts), next: s.nextWorkout };
+  // A day between the two workouts: squat was 22.5 after Monday's session.
+  const day = new Date(Date.UTC(2026, 9, 13, 10)).toISOString();
+  assert.equal(weightOn(s, "squat", day), 22.5, "the weight Monday's session set up for next time");
+  assert.equal(weightOn(s, "squat", new Date(Date.UTC(2026, 9, 1)).toISOString()), s.lifts.squat.weight, "before any history: current weight");
+  const draft = manualDraft(s, "A", day);
+  assert.deepEqual(draft.exercises.map((e) => e.log.length), [5, 5, 5]);
+  assert.ok(draft.exercises.every((e) => e.log.every((r) => r === 5)), "prefilled as done");
+  draft.exercises[0].weight = 100;
+  draft.exercises[0].log[4] = 3;
+  s = addManualWorkout(s, draft, "m1");
+  assert.deepEqual(s.history.map((h) => h.id).slice(1, 2), ["m1"], "sorted into place, newest first");
+  assert.equal(s.history[1].manual, true);
+  assert.equal(s.history[1].exercises[0].result, "failed");
+  assert.equal(JSON.stringify(s.lifts), before.lifts, "working weights unchanged");
+  assert.equal(s.nextWorkout, before.next, "A/B order unchanged");
+  assert.deepEqual(liftSeries(s.history, "squat").map((p) => p.weight), [20, 100, 22.5], "progress follows dates");
+  assert.ok(Math.round(bestOneRepMax(s.history, "squat")) >= 116, "counts for 1RM");
+  s = deleteWorkout(s, "m1");
+  assert.equal(s.history.length, 2);
+});
+
+test("export file round-trips and rejects junk", async () => {
+  const { makeBackup, readBackup } = await import("../src/program.js");
+  let s = createState(TODAY);
+  s = finishWorkout(s, logAll(startWorkout(s, "A", Date.UTC(2026, 9, 12)), s.settings));
+  s.active = startWorkout(s, "B");
+  const file = JSON.stringify(makeBackup(s, Date.UTC(2026, 9, 19)));
+  const back = readBackup(file, TODAY);
+  assert.equal(JSON.parse(file).format, "starkheben-5x5-backup");
+  assert.equal(back.history.length, 1);
+  assert.equal(back.lifts.squat.weight, 22.5);
+  assert.equal(back.active, null, "a workout in progress isn't exported");
+  assert.ok(readBackup(JSON.stringify(s), TODAY), "plain state (older backups) still imports");
+  assert.equal(readBackup("not json", TODAY), null);
+  assert.equal(readBackup('{"format":"starkheben-5x5-backup","data":{}}', TODAY), null);
+});

@@ -22,6 +22,7 @@ All weights are in kg. All the numbers above can be changed in Settings.
 
 - **Today:** today's planned workout with weights, or the next one if it's a rest day. You can also train any day, or do the other workout instead.
 - **Logging:** tap a set circle to log full reps; tap again to lower the count. Plate calculator (tap the weight), warm-up sets, and − / + to adjust today's weight.
+- **Past workouts:** in the Calendar, tap a past day → **Add a workout on this day**. It counts for graphs, strength standards and streaks but leaves your current working weights alone. Logged workouts can be deleted there too.
 - **Rest timer:** counts up and beeps at 1:30 and 3:00 after a made set, or 5:00 after a miss.
 - **Schedule (Program tab):** either pick training days and let A/B alternate across them, or set a fixed workout per weekday. Any number of days works, including 2 per week. A change applies from today; past weeks keep their old schedule.
 - **Calendar:** a month view of done, planned, moved and missed workouts. Tap a day to move that one workout to another date; the weekly schedule stays the same. "Put back" undoes a move.
@@ -38,7 +39,7 @@ The page is served by GitHub Pages and syncs through Supabase. People create an 
 - **Setup:** [docs/SETUP.md](docs/SETUP.md) has two steps: run `supabase/schema.sql` in Supabase, then turn on GitHub Pages.
 - **Database access:** the app calls only the `crew_*` database functions. Passwords are bcrypt-hashed, and signing in returns a device token. Security is deliberately minimal (no reset, no rate limiting), so don't reuse a real password.
 - **Updates** from others arrive by polling every 15 seconds and whenever the app comes back to the foreground.
-- **The APK** uses the same accounts. With an empty `src/config.js` the app has no accounts and keeps data on each device.
+- **Without a server:** the Android app is built with `--offline`, so it has no accounts and keeps data on the phone. An empty `src/config.js` does the same for the web page.
 
 ## Shared Claude page (alternative)
 
@@ -65,14 +66,25 @@ To use it on a phone, host the folder on any static host (for example GitHub Pag
 
 ## Android app
 
-`android/` wraps the app in a small native WebView shell. It loads the bundled page from inside the APK, needs no internet permission, and runs fully offline. It's built without Gradle, using Ubuntu's Android packages:
+`android/` wraps the app in a small native WebView shell for Google Play. The Android app is device-only: no accounts, no Crew tab, no internet permission. Data stays on the phone, and **Settings → Export / Import data** moves it to and from the web version.
+
+The build doesn't use Gradle. It needs Ubuntu's Android packages and Google's bundletool:
 
 ```bash
 sudo apt-get install android-sdk-platform-23 aapt dalvik-exchange zipalign apksigner
-./android/build.sh        # → dist/starkheben-5x5.apk
+BUNDLETOOL=bundletool-all.jar UPLOAD_KEYSTORE=starkheben-upload.jks UPLOAD_STORE_PASS=… ./android/build.sh
 ```
 
-The first build creates a local signing key, `android/debug.keystore` (not committed). Keep it: Android only installs an update over an existing install when both are signed with the same key. With a new key, uninstall first, which deletes the app's data, so save a backup in Settings before that.
+- **Output:** `dist/starkheben-5x5.aab` (Google Play, signed with your upload key) and `dist/starkheben-5x5.apk` (direct install, signed with a local debug key).
+- **App:** targets Android 16 (API 36), runs on Android 5.0+. It draws edge to edge, has an adaptive and themed icon, and uses Android's file pickers for import and export.
+- **Publishing:** store listing, assets and the step-by-step guide are in [docs/PLAY_STORE.md](docs/PLAY_STORE.md) and `store/`. The privacy policy is `privacy.html`.
+
+## Export and import
+
+**Settings → Your data** has the same controls in every version.
+
+- **Export** saves a JSON file. On the web it's a normal download; in the Android app, Android's "save to…" dialog. On the Claude page, where downloads are blocked, you copy the text instead.
+- **Import** reads such a file and **replaces all current data**, after a warning that says how many workouts will be overwritten. In the web version this replaces your account's data on every device.
 
 ## Layout
 
@@ -88,5 +100,6 @@ The first build creates a local signing key, `android/debug.keystore` (not commi
 - `sw.js`, `manifest.webmanifest`, `icon.svg`: offline and install support
 - `scripts/build-single.mjs`: bundles everything into one HTML file
 - `android/`: native Android shell and its build script
+- `store/`: Play Store icon, feature graphic, screenshots and the icon artwork; `privacy.html`: privacy policy
 
 This is an independent app built from the publicly known 5×5 method. It isn't affiliated with or derived from any commercial 5×5 app.

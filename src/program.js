@@ -191,7 +191,7 @@ export function finishWorkout(state, session, now = Date.now()) {
     ...state,
     lifts,
     templates,
-    history: [entry, ...state.history],
+    history: sortHistory([entry, ...state.history]),
     nextWorkout: session.type === "A" ? "B" : "A",
     active: null,
   };
@@ -228,13 +228,77 @@ export function bestOneRepMax(history, liftId) {
 /** Chronological working weights for a main lift id or an assistance name. */
 export function liftSeries(history, key) {
   const points = [];
-  for (const h of [...history].reverse()) {
+  for (const h of [...history].sort((a, b) => a.date.localeCompare(b.date))) {
     for (const ex of h.exercises) {
       const match = ex.type === "main" ? ex.liftId === key : ex.name === key;
       if (match && ex.log.some((r) => r !== null)) points.push({ date: h.date, weight: ex.weight });
     }
   }
   return points;
+}
+
+/** History is kept newest first. */
+export const sortHistory = (history) => [...history].sort((a, b) => b.date.localeCompare(a.date));
+
+/** The working weight a lift had on a date: what the last session before it set up next, else today's working weight. */
+export function weightOn(state, liftId, dateIso) {
+  for (const h of sortHistory(state.history)) {
+    if (h.date >= dateIso) continue;
+    const ex = h.exercises.find((e) => e.type === "main" && e.liftId === liftId);
+    if (ex) return ex.nextWeight ?? ex.weight;
+  }
+  return state.lifts[liftId].weight;
+}
+
+/** A blank-ish workout to fill in after the fact: the template's exercises at the weights of that day, every set done. */
+export function manualDraft(state, type, dateIso) {
+  const exercises = state.templates[type].map((item) => {
+    const ex = item.type === "main"
+      ? { type: "main", liftId: item.liftId, scheme: item.scheme, weight: weightOn(state, item.liftId, dateIso),
+          ...(item.scheme === "topBackoff" ? { backoff: { ...state.settings.topBackoff } } : {}) }
+      : { type: "assist", key: item.id, name: item.name, sets: item.sets, reps: item.reps, unit: item.unit, weight: item.weight };
+    return { ...ex, log: targetsFor(ex, state.settings).map((t) => t.reps) };
+  });
+  return { type, date: dateIso, exercises };
+}
+
+/**
+ * Adds a workout logged after the fact (e.g. on a past day). It counts for history, graphs and streaks,
+ * but leaves working weights and the A/B order alone: those follow the workouts done in the app.
+ */
+export function addManualWorkout(state, draft, id) {
+  const exercises = draft.exercises.map((ex) => ({
+    ...ex,
+    result: exerciseResult(ex, state.settings),
+    weights: targetsFor(ex, state.settings).map((t) => t.weight),
+  }));
+  const entry = { id, date: draft.date, type: draft.type, manual: true, exercises, finishedAt: draft.date };
+  return { ...state, history: sortHistory([...state.history, entry]) };
+}
+
+export function deleteWorkout(state, id) {
+  return { ...state, history: state.history.filter((h) => h.id !== id) };
+}
+
+// ---------- export / import ----------
+
+export const BACKUP_FORMAT = "starkheben-5x5-backup";
+
+/** The export file's contents: everything except a workout in progress. */
+export function makeBackup(state, now = Date.now()) {
+  return { format: BACKUP_FORMAT, version: 1, exportedAt: new Date(now).toISOString(), data: { ...state, active: null } };
+}
+
+/** Reads an export file (or older plain backups). Returns valid state or null; never throws. */
+export function readBackup(text, today) {
+  try {
+    const raw = typeof text === "string" ? JSON.parse(text) : text;
+    const data = raw?.format === BACKUP_FORMAT ? raw.data : raw;
+    const state = migrate(data, today);
+    return state && { ...state, history: sortHistory(state.history) };
+  } catch {
+    return null;
+  }
 }
 
 // ---------- migration and validation ----------

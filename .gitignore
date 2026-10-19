@@ -2,3 +2,4 @@ node_modules/
 dist/
 android/build/
 android/*.keystore
+*.jks
