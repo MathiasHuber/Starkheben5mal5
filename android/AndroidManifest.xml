@@ -1,13 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="app.starkheben.fivebyfive"
-    android:versionCode="5"
-    android:versionName="1.0">
+    android:versionCode="6"
+    android:versionName="1.1">
 
-    <!-- Targets Android 16 (Play requires a recent target). No permissions beyond vibration:
-         all data stays on the device. -->
+    <!-- Targets Android 16 (Play requires a recent target). No permissions: all data stays on the device. -->
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
-    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:label="@string/app_name"

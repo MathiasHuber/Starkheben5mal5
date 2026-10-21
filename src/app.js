@@ -1,8 +1,10 @@
 import {
-  LIFTS, ASSISTANCE, createState, startWorkout, finishWorkout, cycleSet, exerciseResult, targetsFor,
-  platesPerSide, warmupSets, restTargets, migrate, validateSession, loadStep, deloadLift, suggestDeload,
+  LIFTS, ASSISTANCE, VARIATIONS, MAIN_CHOICES, createState, startWorkout, finishWorkout, cycleSet, exerciseResult, targetsFor,
+  warmupSets, migrate, validateSession, deloadLift, suggestDeload,
   moveItem, bestOneRepMax, liftSeries, manualDraft, addManualWorkout, deleteWorkout, makeBackup, readBackup,
+  sessionLabel, addCustomWorkout, updateCustomWorkout, removeCustomWorkout, addToLibrary, removeFromLibrary, exerciseItem,
 } from "./program.js";
+import { PLATE_SIZES, MICRO_SIZE, barbellPlan, buddyPlan, nextLoadable } from "./plates.js";
 import {
   WEEKDAY_NAMES, WEEK_ORDER, todayKey, toKey, fromKey, addDays, weekStart, occurrences, upcoming,
   streakWeeks, setSchedule, moveOccurrence, scheduleOn, daysPerWeek, historyKey,
@@ -20,7 +22,6 @@ let state = load();
 let view = "today";
 const ui = {
   summary: null, // last finished session, shown once after finishing
-  plates: new Set(),
   warmups: new Set(),
   chosenType: null, // overrides the planned workout on the Today screen
   calMonth: todayKey().slice(0, 7),
@@ -34,7 +35,7 @@ const ui = {
   flash: "", // one-off message for the settings page
   crewOpen: null,
 };
-let timer = null; // { start, targets, beeped, missed }
+let timer = null; // { start }: the stopwatch since the last logged set
 
 // ---------- persistence ----------
 
@@ -266,12 +267,73 @@ const exName = (ex) => (ex.type === "main" ? LIFTS[ex.liftId].name : ex.name);
 const newId = () => Math.random().toString(36).slice(2, 10);
 const workouts = (n) => `${n} workout${n === 1 ? "" : "s"}`;
 
-function platesText(weight) {
-  const { plates, remainder } = platesPerSide(weight, state.settings);
-  if (!plates.length) return `Empty bar (${kg(state.settings.bar)})`;
-  const extra = remainder > 0 ? ` · ${kg(remainder)} per side can't be loaded` : "";
-  return `Per side: ${plates.map(fmt).join(" + ")}${extra}`;
+// ---------- plate drawing ----------
+// Plates in their usual competition colours; height and thickness roughly to scale.
+const PLATE_LOOK = {
+  25: { h: 64, w: 15, fill: "#d6372b", text: "#ffffff" },
+  20: { h: 64, w: 13, fill: "#2f6fdf", text: "#ffffff" },
+  15: { h: 56, w: 12, fill: "#e8b100", text: "#1a1a1a" },
+  10: { h: 48, w: 11, fill: "#1f8a4c", text: "#ffffff" },
+  5: { h: 38, w: 10, fill: "#f2f2f2", text: "#1a1a1a" },
+  2.5: { h: 30, w: 9, fill: "#d6372b", text: "#ffffff" },
+  2: { h: 28, w: 9, fill: "#2f6fdf", text: "#ffffff" },
+  1.25: { h: 26, w: 9, fill: "#b8bec9", text: "#1a1a1a" },
+  1: { h: 24, w: 8, fill: "#b8bec9", text: "#1a1a1a" },
+  0.5: { h: 20, w: 8, fill: "#7d8491", text: "#ffffff" },
+};
+
+/** The right half of a barbell with its plates, inner to outer. Plates from `swapFrom` on are drawn dashed. */
+function barbellSvg(plates, swapFrom = plates.length) {
+  const H = 72, mid = H / 2;
+  let x = 44;
+  const parts = plates.map((p, i) => {
+    const look = PLATE_LOOK[p] ?? { h: 22, w: 8, fill: "#b8bec9", text: "#1a1a1a" };
+    const cx = x + look.w / 2;
+    const el = `<g class="plate${i >= swapFrom ? " swap" : ""}"><rect x="${x}" y="${mid - look.h / 2}" width="${look.w}" height="${look.h}" rx="2" style="fill:${look.fill}"/>`
+      + `<text x="${cx}" y="${mid}" transform="rotate(-90 ${cx} ${mid})" style="fill:${look.text}">${fmt(p)}</text></g>`;
+    x += look.w + 2;
+    return el;
+  }).join("");
+  const end = Math.max(x + 16, 110);
+  const label = plates.length ? `Per side: ${plates.map(fmt).join(", ")} kg` : "Empty bar";
+  const scale = 1.4; // drawn larger than its grid so the plate labels stay readable
+  return `<svg class="barbell" viewBox="0 0 ${end} ${H}" width="${end * scale}" height="${H * scale}" role="img" aria-label="${esc(label)}">
+    <rect class="shaft" x="0" y="${mid - 3}" width="36" height="6" rx="2"/>
+    <rect class="sleeve" x="40" y="${mid - 5}" width="${end - 42}" height="10" rx="3"/>
+    <rect class="collar" x="34" y="${mid - 13}" width="8" height="26" rx="2"/>
+    ${parts}
+  </svg>`;
 }
+
+const plateList = (plates) => plates.map(fmt).join(" + ");
+
+/** What to load for a weight; with a buddy, both loads with the plates that change at the outer end. */
+function plateBlock(weight, buddyWeight = null) {
+  const s = state.settings;
+  if (buddyWeight === null) {
+    const { plates, remainder } = barbellPlan(weight, s);
+    const note = remainder > 0
+      ? `<p class="small warn">${kg(weight)} can't be made with your plates. Loaded: ${kg(weight - remainder * 2)}.</p>`
+      : plates.length ? "" : `<p class="small muted">Empty bar (${kg(s.bar)})</p>`;
+    return `<div class="loading">${barbellSvg(plates)}${note}</div>`;
+  }
+  const p = buddyPlan(weight, buddyWeight, s);
+  const row = (who, w, outer) => `<div class="load-row"><span class="small muted">${who} · ${kg(w)}</span>${barbellSvg([...p.shared, ...outer], p.shared.length)}</div>`;
+  const steps = [p.mine.length ? `take off ${plateList(p.mine)}` : "", p.buddy.length ? `put on ${plateList(p.buddy)}` : ""].filter(Boolean);
+  const how = steps.length
+    ? `Switching from you to your buddy: ${steps.join(" and ")} per side (dashed). Back again: the reverse.`
+    : "Same plates for both of you.";
+  return `<div class="loading">${row("You", p.myWeight, p.mine)}${row("Buddy", p.buddyWeight, p.buddy)}<p class="small">${esc(how)}</p></div>`;
+}
+
+/** The weight of the next set still to do (the last set's weight once all are logged). */
+function currentWeight(ex) {
+  const targets = targetsFor(ex, state.settings);
+  const j = ex.log.findIndex((r) => r === null);
+  return targets[j === -1 ? targets.length - 1 : j]?.weight ?? ex.weight;
+}
+
+const isBarbell = (ex) => ex.type === "main" || ex.barbell === true;
 
 function itemSummary(item) {
   if (item.type === "main") {
@@ -287,10 +349,11 @@ function itemSummary(item) {
 
 const FLAME = `<svg class="flame" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2c.6 3.2-1.4 5-2.8 6.7C7.8 10.4 7 12 7 14a5 5 0 0 0 10 0c0-2.3-1-4-2-5.2.1 1.8-.6 3-1.8 3.6.6-3.6-.2-7.4-1.2-10.4z"/></svg>`;
 
-// ---------- rest timer ----------
+// ---------- set stopwatch ----------
+// Counts up from the last logged set. No alerts: you decide when to go again.
 
-function startTimer(reps, target) {
-  timer = { start: Date.now(), targets: restTargets(reps, target, state.settings), beeped: 0, missed: reps < target };
+function startTimer() {
+  timer = { start: Date.now() };
   tickTimer();
 }
 
@@ -299,35 +362,14 @@ function stopTimer() {
   timerEl.hidden = true;
 }
 
-function beep() {
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const osc = ctx.createOscillator();
-    osc.frequency.value = 880;
-    osc.connect(ctx.destination);
-    osc.start();
-    osc.stop(ctx.currentTime + 0.25);
-    osc.onended = () => ctx.close();
-  } catch { /* audio not allowed */ }
-  navigator.vibrate?.([200, 100, 200]);
-}
-
 function tickTimer() {
   if (!timer) return;
-  const elapsed = (Date.now() - timer.start) / 1000;
-  while (timer.beeped < timer.targets.length && elapsed >= timer.targets[timer.beeped]) {
-    timer.beeped++;
-    beep();
-  }
-  const hint = timer.missed
-    ? `Missed reps: rest ${mmss(timer.targets[0])}`
-    : `Rest ${mmss(timer.targets[0])} if easy, ${mmss(timer.targets[1])} if hard`;
   timerEl.hidden = false;
   timerEl.innerHTML = `
-    <div><div class="clock">${mmss(elapsed)}</div><div class="small">${esc(hint)}</div></div>
-    <button class="btn" data-action="stop-timer">Dismiss</button>`;
+    <div><div class="small">Since your last set</div><div class="clock">${mmss((Date.now() - timer.start) / 1000)}</div></div>
+    <button class="btn" data-action="stop-timer">Hide</button>`;
 }
-setInterval(tickTimer, 500);
+setInterval(tickTimer, 1000);
 
 // ---------- rendering ----------
 
@@ -393,7 +435,10 @@ function todayView() {
     ${nextLine}
     <div class="card">${rows}</div>
     <button class="btn primary block" data-action="start" data-type="${type}">Start workout ${type}</button>
-    <div class="center"><button class="btn link" data-action="choose" data-type="${other}">Do workout ${other} instead</button></div>`;
+    <div class="center"><button class="btn link" data-action="choose" data-type="${other}">Do workout ${other} instead</button></div>
+    ${state.workouts.length ? `<h2>Your workouts</h2><div class="card">${state.workouts.map((w) => `<div class="line">
+      <span>${esc(w.name)} <span class="muted small">${w.items.length} exercise${w.items.length === 1 ? "" : "s"}</span></span>
+      <button class="btn small" data-action="start" data-workout="${esc(w.id)}" ${w.items.length ? "" : "disabled"}>Start</button></div>`).join("")}</div>` : ""}`;
 }
 
 function summaryCard(s) {
@@ -402,8 +447,10 @@ function summaryCard(s) {
     <div class="line">
       <span>${esc(LIFTS[ex.liftId].name)}</span>
       <span>${fmt(ex.weight)} → <strong>${kg(state.lifts[ex.liftId].weight)}</strong> <span class="tag ${esc(ex.change)}">${esc(label[ex.change])}</span></span>
-    </div>${ex.change === "repeat" ? deloadControl(ex.liftId) : ""}`).join("");
-  return `<div class="card"><div class="row between"><strong>Workout ${esc(s.type)} done</strong>
+    </div>${ex.change === "repeat" ? deloadControl(ex.liftId) : ""}`).join("")
+    + (s.custom ? s.exercises.map((ex) => `<div class="line"><span>${esc(ex.name)}</span>
+      <span class="muted nowrap">${ex.weight ? kg(ex.weight) + " · " : ""}${ex.log.map((r) => (r === null ? "–" : r)).join("/")}</span></div>`).join("") : "");
+  return `<div class="card"><div class="row between"><strong>${esc(sessionLabel(s))} done</strong>
     <button class="btn link" data-action="dismiss-summary">Close</button></div>${rows}</div>`;
 }
 
@@ -427,7 +474,11 @@ function setCircles(ex, i, action = "set") {
 }
 
 function activeView(session) {
-  const step = loadStep(state.settings);
+  const buddy = session.buddy?.on ? session.buddy : null;
+  const buddyWeight = (ex, i) => (buddy && isBarbell(ex) ? buddy.weights?.[i] ?? currentWeight(ex) : null);
+  const buddyField = (ex, i) => (buddy && isBarbell(ex)
+    ? `<label class="inline small muted buddy-field">Buddy's weight
+        <input type="number" inputmode="decimal" min="0" step="0.5" id="buddy-weight-${i}" data-input="buddy-weight" data-ex="${i}" value="${fmt(buddyWeight(ex, i))}"> kg</label>` : "");
   const cards = session.exercises.map((ex, i) => {
     if (ex.type === "assist") {
       return `<div class="card">
@@ -436,26 +487,28 @@ function activeView(session) {
           <label class="inline small muted">Weight
             <input type="number" inputmode="decimal" min="0" step="0.5" id="assist-weight-${i}" data-input="assist-weight" data-ex="${i}" value="${fmt(ex.weight)}"> kg</label>
         </div>
+        ${ex.barbell ? `${buddyField(ex, i)}${plateBlock(ex.weight, buddyWeight(ex, i))}` : ""}
         ${setCircles(ex, i)}
       </div>`;
     }
     const lift = LIFTS[ex.liftId];
     const warm = ui.warmups.has(i)
       ? `<ul class="warmups">${warmupSets(ex.liftId, ex.weight, state.settings).map((w) =>
-          `<li>${w.reps} × ${kg(w.weight)}</li>`).join("") || "<li>No warm-up needed</li>"}</ul>`
+          `<li>${w.reps} × ${kg(w.weight)} <span class="muted">· ${esc(plateList(barbellPlan(w.weight, state.settings).plates) || "bar only")}</span></li>`).join("") || "<li>No warm-up needed</li>"}</ul>`
       : "";
     return `<div class="card">
       <div class="row between">
         <div>
           <div class="lift-name">${esc(lift.name)} <span class="muted small">${esc(itemSummary(ex))}</span></div>
-          <button class="weight" data-action="plates" data-ex="${i}" aria-expanded="${ui.plates.has(i)}">${fmt(ex.weight)} <small>kg</small></button>
+          <div class="weight">${fmt(ex.weight)} <small>kg</small></div>
         </div>
         <div class="row">
-          <button class="btn icon" data-action="weight" data-ex="${i}" data-delta="${-step}" aria-label="Lower ${esc(lift.name)} weight">−</button>
-          <button class="btn icon" data-action="weight" data-ex="${i}" data-delta="${step}" aria-label="Raise ${esc(lift.name)} weight">+</button>
+          <button class="btn icon" data-action="weight" data-ex="${i}" data-dir="-1" aria-label="Lower ${esc(lift.name)} weight">−</button>
+          <button class="btn icon" data-action="weight" data-ex="${i}" data-dir="1" aria-label="Raise ${esc(lift.name)} weight">+</button>
         </div>
       </div>
-      ${ui.plates.has(i) ? `<div class="plates">${esc(platesText(ex.weight))}</div>` : ""}
+      ${buddyField(ex, i)}
+      ${plateBlock(currentWeight(ex), buddyWeight(ex, i))}
       ${setCircles(ex, i)}
       <div class="row between" style="margin-top:6px">
         <span class="set-label">Tap a set when done, tap again to lower reps</span>
@@ -464,7 +517,10 @@ function activeView(session) {
       ${warm}
     </div>`;
   }).join("");
-  return `<h2>Workout ${esc(session.type)} <span class="muted small">${esc(isoDayLabel(session.date))}</span></h2>
+  const anyBarbell = session.exercises.some(isBarbell);
+  return `<h2>${esc(sessionLabel(session))} <span class="muted small">${esc(isoDayLabel(session.date))}</span></h2>
+    ${anyBarbell ? `<label class="card check buddy-toggle"><input type="checkbox" id="buddy-on" data-input="buddy-on" ${buddy ? "checked" : ""}>
+      <span><strong>Training with a buddy</strong><br><span class="small muted">Enter their weights to load the bar with the fewest plate switches.</span></span></label>` : ""}
     ${cards}
     <button class="btn primary block" data-action="finish">Finish workout</button>
     <div class="center"><button class="btn link" data-action="cancel">Discard workout</button></div>`;
@@ -484,9 +540,10 @@ function manualView() {
     ${setCircles(ex, i, "manual-set")}
   </div>`).join("");
   return `<h2>Add a workout <span class="muted small">${esc(dayLabel(day))}</span></h2>
-    <div class="seg" role="group" aria-label="Workout">
-      <button data-action="manual-type" data-type="A" aria-pressed="${m.type === "A"}">Workout A</button>
-      <button data-action="manual-type" data-type="B" aria-pressed="${m.type === "B"}">Workout B</button>
+    <div class="chips" role="group" aria-label="Workout">
+      <button class="chip" data-action="manual-type" data-type="A" aria-pressed="${!m.custom && m.type === "A"}">Workout A</button>
+      <button class="chip" data-action="manual-type" data-type="B" aria-pressed="${!m.custom && m.type === "B"}">Workout B</button>
+      ${state.workouts.filter((w) => w.items.length).map((w) => `<button class="chip" data-action="manual-type" data-workout="${esc(w.id)}" aria-pressed="${m.custom?.id === w.id}">${esc(w.name)}</button>`).join("")}
     </div>
     <p class="small muted">Sets start as done. Tap one to lower its reps, or tap through to clear it. Your current working weights stay as they are.</p>
     ${cards}
@@ -495,6 +552,9 @@ function manualView() {
 }
 
 // ---------- calendar ----------
+
+/** Calendar letter: A or B, or the first letter of your own workout's name. */
+const markLetter = (h) => (h.custom ? h.custom.name.trim().charAt(0).toUpperCase() || "+" : h.type);
 
 function calendarView() {
   const today = todayKey();
@@ -516,7 +576,7 @@ function calendarView() {
     const inMonth = k.startsWith(ui.calMonth);
     const done = doneOn[k] ?? [];
     const plans = planned[k] ?? [];
-    let marks = done.map((h) => `<span class="mark done">${esc(h.type)}</span>`).join("");
+    let marks = done.map((h) => `<span class="mark done">${esc(markLetter(h))}</span>`).join("");
     const open = k < today ? plans.slice(done.length) : k === today ? plans.filter((o) => types[`${o.original}>${o.date}`]) : plans;
     marks += open.map((o) => {
       if (k < today) return `<span class="mark missed" title="Missed">×</span>`;
@@ -551,7 +611,7 @@ function dayDetail(k, today, types, doneOn) {
   const done = doneOn[k] ?? [];
   const plans = occurrences(state, k, k);
   const doneRows = done.map((h) => `<div class="plan">
-    <div class="line"><span><span class="mark done">${esc(h.type)}</span> Workout ${esc(h.type)}${h.manual ? ` <span class="tag none">added</span>` : ""}</span>
+    <div class="line"><span><span class="mark done">${esc(markLetter(h))}</span> ${esc(sessionLabel(h))}${h.manual ? ` <span class="tag none">added</span>` : ""}</span>
       <button class="btn small" data-action="delete-workout" data-id="${esc(h.id)}">Delete</button></div>
     ${h.exercises.map((e) => `<div class="line small"><span>${esc(exName(e))}</span>
       <span class="muted nowrap">${kg(e.weight)} · ${e.log.map((r) => (r === null ? "–" : r)).join("/")}</span></div>`).join("")}
@@ -628,7 +688,8 @@ function chartSvg(series, title) {
 }
 
 function liftChips(keys, selected, action) {
-  return keys.map((k) => `<button class="chip" data-action="${action}" data-key="${esc(k)}" aria-pressed="${k === selected}">${esc(LIFTS[k]?.name ?? k)}</button>`).join("");
+  const label = (k) => LIFTS[k]?.name ?? (Object.values(LIFTS).some((l) => l.name === k) ? `${k} (own workouts)` : k);
+  return keys.map((k) => `<button class="chip" data-action="${action}" data-key="${esc(k)}" aria-pressed="${k === selected}">${esc(label(k))}</button>`).join("");
 }
 
 function progressView() {
@@ -755,7 +816,7 @@ function memberCard(m, i) {
   return `<div class="card member">
     <div class="row between">
       <div class="row">${avatar}<div><strong class="member-name"></strong>${m.me ? ` <span class="muted small">you</span>` : ""}
-        <div class="small muted">${last ? `Last: ${esc(isoDayLabel(last.date))} · Workout ${esc(last.type)}` : "No workouts yet"}${next ? ` · Next: ${esc(dayLabel(next.date))}` : ""}</div></div></div>
+        <div class="small muted">${last ? `Last: ${esc(isoDayLabel(last.date))} · ${esc(sessionLabel(last))}` : "No workouts yet"}${next ? ` · Next: ${esc(dayLabel(next.date))}` : ""}</div></div></div>
       <span class="streak ${weeks ? "on" : ""}">${FLAME}${weeks}</span>
     </div>
     <h3>Working weights</h3>
@@ -815,16 +876,72 @@ function programView() {
         <button class="btn" data-action="reset-schedule">Cancel</button>
         <span class="small muted">Applies from today. Past weeks and moved workouts stay as they are.</span></div>` : ""}
     </div>
-    <h2>Workout templates</h2>
-    <div class="seg" role="group" aria-label="Template">
-      <button data-action="editor-type" data-type="A" aria-pressed="${ui.editorType === "A"}">Workout A</button>
-      <button data-action="editor-type" data-type="B" aria-pressed="${ui.editorType === "B"}">Workout B</button>
+    <h2>Workouts</h2>
+    <div class="chips" role="group" aria-label="Workout to edit">
+      <button class="chip" data-action="editor-type" data-type="A" aria-pressed="${ui.editorType === "A"}">Workout A</button>
+      <button class="chip" data-action="editor-type" data-type="B" aria-pressed="${ui.editorType === "B"}">Workout B</button>
+      ${state.workouts.map((w) => `<button class="chip" data-action="editor-type" data-type="${esc(w.id)}" aria-pressed="${ui.editorType === w.id}">${esc(w.name)}</button>`).join("")}
     </div>
-    ${templateEditor(ui.editorType)}`;
+    ${templateEditor(ui.editorType)}
+    <div class="card">
+      <strong>New workout</strong>
+      <p class="small muted">Build your own workout from the main lifts, their variations, assistance work and your own exercises. A and B keep their 5×5 progression; your own workouts remember the weights you used.</p>
+      <div class="row wrap">
+        <input type="text" id="new-workout-name" class="text-input" maxlength="40" placeholder="e.g. Volume day" aria-label="Workout name">
+        <button class="btn" data-action="workout-new">Create</button>
+      </div>
+    </div>
+    ${libraryCard()}`;
+}
+
+const isOwnWorkout = () => ui.editorType !== "A" && ui.editorType !== "B";
+const editorList = () => (isOwnWorkout() ? state.workouts.find((w) => w.id === ui.editorType)?.items ?? [] : state.templates[ui.editorType]);
+function setEditorList(list) {
+  if (isOwnWorkout()) state = updateCustomWorkout(state, ui.editorType, () => ({ items: list }));
+  else state.templates[ui.editorType] = list;
+}
+
+function libraryCard() {
+  if (!state.library.length) return "";
+  return `<h2>Your exercise library</h2>
+    <div class="card">
+      <p class="small muted">Custom exercises you've added. They're offered again when you add an exercise.</p>
+      ${state.library.map((e) => `<div class="line"><span>${esc(e.name)} <span class="muted small">${e.sets}×${e.reps}${e.unit === "sec" ? " s" : ""}${e.barbell ? " · barbell" : ""}</span></span>
+        <button class="btn small" data-action="lib-remove" data-id="${esc(e.id)}">Remove</button></div>`).join("")}
+    </div>`;
+}
+
+/** The "add exercise" picker. Your own workouts can use the main lifts and variations; A and B get assistance first. */
+function addExerciseCard(own, label) {
+  const opt = (prefix, list) => list.map((a, i) => `<option value="${prefix}:${prefix === "l" ? esc(a.id) : i}">${esc(a.name)} (${a.sets}×${a.reps}${a.unit === "sec" ? " s" : ""})</option>`).join("");
+  const groups = [
+    own ? `<optgroup label="Main lifts">${opt("m", MAIN_CHOICES)}</optgroup>` : "",
+    own ? `<optgroup label="Variations">${opt("v", VARIATIONS)}</optgroup>` : "",
+    `<optgroup label="Assistance">${opt("a", ASSISTANCE)}</optgroup>`,
+    !own ? `<optgroup label="Variations">${opt("v", VARIATIONS)}</optgroup>` : "",
+    state.library.length ? `<optgroup label="Your exercises">${opt("l", state.library)}</optgroup>` : "",
+  ].join("");
+  return `<div class="card">
+      <strong>Add ${own ? "an exercise" : "assistance exercise"}</strong>
+      <label class="field wide"><span>Exercise</span><select id="add-assist" data-input="add-assist">
+        ${groups}<option value="custom">Custom exercise…</option></select></label>
+      <div id="custom-assist" hidden>
+        <label class="field wide"><span>Name</span><input type="text" id="custom-name" maxlength="60" placeholder="e.g. Face pulls"></label>
+        <label class="field"><span>Sets</span><input type="number" id="custom-sets" min="1" max="10" value="3"></label>
+        <label class="field"><span>Reps</span><input type="number" id="custom-reps" min="1" max="300" value="10"></label>
+        <label class="field"><span>Counted in</span><select id="custom-unit"><option value="reps">Reps</option><option value="sec">Seconds</option></select></label>
+        <label class="check"><input type="checkbox" id="custom-barbell"> Barbell exercise (show plates)</label>
+        <p class="small muted">Saved to your exercise library for next time.</p>
+      </div>
+      <button class="btn primary" data-action="tpl-add">Add to ${esc(label)}</button>
+      <p class="small muted" id="tpl-status" role="status"></p>
+    </div>`;
 }
 
 function templateEditor(type) {
-  const list = state.templates[type];
+  const own = isOwnWorkout() ? state.workouts.find((w) => w.id === type) : null;
+  if (isOwnWorkout() && !own) { ui.editorType = "A"; return templateEditor("A"); }
+  const list = editorList();
   const items = list.map((item, i) => {
     const moveBtns = `<div class="row">
       <button class="btn icon" data-action="tpl-move" data-i="${i}" data-dir="-1" ${i === 0 ? "disabled" : ""} aria-label="Move up">↑</button>
@@ -840,7 +957,7 @@ function templateEditor(type) {
       </li>`;
     }
     return `<li class="card tpl">
-      <div class="row between"><div><span class="lift-name">${esc(item.name)}</span> <span class="tag none">assistance</span></div>${moveBtns}</div>
+      <div class="row between"><div><span class="lift-name">${esc(item.name)}</span> <span class="tag none">${own ? (item.barbell ? "barbell" : "exercise") : "assistance"}</span></div>${moveBtns}</div>
       <div class="row wrap">
         <label class="inline small">Sets <input type="number" min="1" max="10" step="1" id="tpl-sets-${item.id}" data-input="tpl-sets" data-i="${i}" value="${item.sets}"></label>
         <label class="inline small">${item.unit === "sec" ? "Seconds" : "Reps"} <input type="number" min="1" max="300" step="1" id="tpl-reps-${item.id}" data-input="tpl-reps" data-i="${i}" value="${item.reps}"></label>
@@ -848,21 +965,14 @@ function templateEditor(type) {
       </div>
     </li>`;
   }).join("");
-  const options = ASSISTANCE.map((a, i) => `<option value="${i}">${esc(a.name)} (${a.sets}×${a.reps}${a.unit === "sec" ? " s" : ""})</option>`).join("");
-  return `<ol class="tpl-list">${items}</ol>
-    <div class="card">
-      <strong>Add assistance exercise</strong>
-      <label class="field wide"><span>Exercise</span><select id="add-assist" data-input="add-assist">
-        ${options}<option value="custom">Custom exercise…</option></select></label>
-      <div id="custom-assist" hidden>
-        <label class="field wide"><span>Name</span><input type="text" id="custom-name" maxlength="60" placeholder="e.g. Face pulls"></label>
-        <label class="field"><span>Sets</span><input type="number" id="custom-sets" min="1" max="10" value="3"></label>
-        <label class="field"><span>Reps</span><input type="number" id="custom-reps" min="1" max="300" value="10"></label>
-        <label class="field"><span>Counted in</span><select id="custom-unit"><option value="reps">Reps</option><option value="sec">Seconds</option></select></label>
-      </div>
-      <button class="btn primary" data-action="tpl-add">Add to workout ${type}</button>
-      <p class="small muted" id="tpl-status" role="status"></p>
-    </div>`;
+  const head = own
+    ? `<div class="card row wrap own-head">
+        <label class="inline small">Name <input type="text" class="text-input" id="workout-name-${esc(own.id)}" data-input="workout-name" maxlength="40" value="${esc(own.name)}"></label>
+        <button class="btn small" data-action="workout-delete">Delete workout</button>
+      </div>`
+    : "";
+  const empty = own && !list.length ? `<p class="small muted">No exercises yet. Add the first one below.</p>` : "";
+  return `${head}${empty}<ol class="tpl-list">${items}</ol>${addExerciseCard(Boolean(own), own ? own.name : `workout ${type}`)}`;
 }
 
 // ---------- sign-in ----------
@@ -926,7 +1036,6 @@ function accountCard() {
 
 function settingsView() {
   const s = state.settings;
-  const step = loadStep(s);
   const field = (label, name, value, attrs = "") =>
     `<label class="field"><span>${esc(label)}</span><input type="number" inputmode="decimal" id="set-${esc(name)}" name="${esc(name)}" value="${esc(value)}" ${attrs}></label>`;
   return `<h2>Settings</h2>
@@ -936,7 +1045,7 @@ function settingsView() {
       ${rpc || window.claude ? `<label class="field wide"><span>Name for your crew</span><input type="text" id="profile-nickname" data-input="profile-nickname" maxlength="30" value="${esc(state.profile.nickname ?? "")}" placeholder="e.g. Mathias"></label>` : ""}
       ${profileFields()}
       <h3>Working weights (kg)</h3>
-      ${Object.keys(LIFTS).map((id) => field(LIFTS[id].name, `weight.${id}`, state.lifts[id].weight, `min="0" step="${step}"`)).join("")}
+      ${Object.keys(LIFTS).map((id) => field(LIFTS[id].name, `weight.${id}`, state.lifts[id].weight, `min="0" step="0.5"`)).join("")}
       <h3>Increase per success (kg)</h3>
       ${Object.keys(LIFTS).map((id) => field(LIFTS[id].name, `inc.${id}`, s.increments[id], `min="0" step="0.5"`)).join("")}
       <h3>Deload</h3>
@@ -946,13 +1055,13 @@ function settingsView() {
       ${field("Back-off sets", "topBackoff.backoffSets", s.topBackoff.backoffSets, `min="1" max="10" step="1"`)}
       ${field("Back-off reps", "topBackoff.backoffReps", s.topBackoff.backoffReps, `min="1" max="20" step="1"`)}
       ${field("Back-off weight (−%)", "topBackoff.backoffPercent", s.topBackoff.backoffPercent, `min="0" max="50" step="1"`)}
-      <h3>Rest timer (seconds)</h3>
-      ${field("If easy", "rest.easy", s.rest.easy, `min="0" step="15"`)}
-      ${field("If hard", "rest.hard", s.rest.hard, `min="0" step="15"`)}
-      ${field("After a miss", "rest.failed", s.rest.failed, `min="0" step="15"`)}
       <h3>Bar and plates</h3>
       ${field("Bar weight (kg)", "bar", s.bar, `min="0" step="0.5"`)}
-      <p class="muted small">Plates: ${s.plates.map(fmt).join(", ")} kg. Deloads and back-off sets round down to ${kg(step)} steps.</p>
+      <p class="small">Plates in your gym</p>
+      <div class="plate-checks">${PLATE_SIZES.map((p) => `<label class="check"><input type="checkbox" id="plate-${String(p).replace(".", "-")}" data-input="plate" data-size="${p}" ${s.plates.includes(p) ? "checked" : ""}> ${fmt(p)} kg</label>`).join("")}</div>
+      <label class="check"><input type="checkbox" id="micro-on" data-input="micro-on" ${s.micro.enabled ? "checked" : ""}> Microplates (${fmt(MICRO_SIZE)} kg)</label>
+      ${s.micro.enabled ? `<label class="field"><span>Pairs of ${fmt(MICRO_SIZE)} kg plates</span><input type="number" id="micro-pairs" data-input="micro-pairs" min="1" max="5" step="1" value="${s.micro.pairs}"></label>` : ""}
+      <p class="muted small">New weights after a successful session, deloads, back-off and warm-up sets only use weights these plates can make. With one pair of 0.5 kg plates and 1 kg increases: 40 → 41 → 42.5 → 43.5 → 45 kg.</p>
     </form>
     <h2>Your data</h2>
     <div class="card data">
@@ -991,12 +1100,12 @@ document.querySelector(".tabs").addEventListener("click", (e) => {
 
 const actions = {
   start(el) {
-    state.active = startWorkout(state, el.dataset.type);
+    state.active = startWorkout(state, el.dataset.type ?? "A", Date.now(), el.dataset.workout ?? null);
     state.active.id += `-${newId()}`; // unique across devices, since it's also the session's storage key
     ui.summary = null;
     ui.chosenType = null;
-    ui.plates.clear();
     ui.warmups.clear();
+    stopTimer();
   },
   choose(el) { ui.chosenType = el.dataset.type; },
   set(el) {
@@ -1005,15 +1114,12 @@ const actions = {
     const target = targetsFor(ex, state.settings)[j].reps;
     const unit = ex.type === "assist" ? ex.unit : "reps";
     ex.log[j] = cycleSet(ex.log[j], target, unit);
-    const isLast = i === state.active.exercises.length - 1 && j === ex.log.length - 1;
-    if (ex.log[j] === null || isLast) stopTimer();
-    else startTimer(ex.log[j], target);
+    if (ex.log[j] !== null) startTimer(); // the stopwatch counts from the last logged set
   },
   weight(el) {
     const ex = state.active.exercises[Number(el.dataset.ex)];
-    ex.weight = Math.max(0, Math.round((ex.weight + Number(el.dataset.delta)) * 100) / 100);
+    ex.weight = nextLoadable(ex.weight, state.settings, Number(el.dataset.dir));
   },
-  plates(el) { toggle(ui.plates, Number(el.dataset.ex)); },
   warmups(el) { toggle(ui.warmups, Number(el.dataset.ex)); },
   async finish() {
     const incomplete = state.active.exercises.some((ex) => ex.log.some((r) => r === null) && exerciseResult(ex, state.settings) !== "success");
@@ -1088,19 +1194,17 @@ const actions = {
   "reset-schedule"() { ui.scheduleDraft = null; },
   "editor-type"(el) { ui.editorType = el.dataset.type; },
   "tpl-move"(el) {
-    const t = ui.editorType;
-    state.templates[t] = moveItem(state.templates[t], Number(el.dataset.i), Number(el.dataset.dir));
+    setEditorList(moveItem(editorList(), Number(el.dataset.i), Number(el.dataset.dir)));
   },
   async "tpl-remove"(el) {
-    const t = ui.editorType;
-    const item = state.templates[t][Number(el.dataset.i)];
-    if (!(await ask(`Remove ${item.name} from workout ${t}?`, "Remove"))) return false;
-    state.templates[t] = state.templates[t].filter((_, i) => i !== Number(el.dataset.i));
+    const i = Number(el.dataset.i);
+    const item = editorList()[i];
+    if (!(await ask(`Remove ${item.name}?`, "Remove"))) return false;
+    setEditorList(editorList().filter((_, k) => k !== i));
   },
   "tpl-add"() {
-    const t = ui.editorType;
     const choice = document.getElementById("add-assist").value;
-    let item;
+    let picked;
     if (choice === "custom") {
       const name = document.getElementById("custom-name").value.trim().slice(0, 60);
       const sets = Math.round(Number(document.getElementById("custom-sets").value));
@@ -1109,11 +1213,34 @@ const actions = {
         document.getElementById("tpl-status").textContent = "Enter a name, 1–10 sets and 1–300 reps or seconds.";
         return false;
       }
-      item = { name, sets, reps, unit: document.getElementById("custom-unit").value === "sec" ? "sec" : "reps" };
+      picked = { name, sets, reps, unit: document.getElementById("custom-unit").value === "sec" ? "sec" : "reps",
+        barbell: document.getElementById("custom-barbell").checked };
+      state = addToLibrary(state, picked); // remembered for next time
     } else {
-      item = ASSISTANCE[Number(choice)];
+      const [kind, key] = choice.split(":");
+      const lists = { m: MAIN_CHOICES, v: VARIATIONS, a: ASSISTANCE };
+      picked = kind === "l" ? state.library.find((e) => e.id === key) : lists[kind]?.[Number(key)];
+      if (!picked) return false;
     }
-    state.templates[t] = [...state.templates[t], { type: "assist", id: newId(), ...item, weight: 0 }];
+    setEditorList([...editorList(), exerciseItem(picked, newId())]);
+  },
+  "workout-new"() {
+    const input = document.getElementById("new-workout-name");
+    const name = input.value.trim();
+    if (!name) { input.focus(); return false; }
+    state = addCustomWorkout(state, name);
+    ui.editorType = state.workouts.at(-1).id;
+  },
+  async "workout-delete"() {
+    const w = state.workouts.find((x) => x.id === ui.editorType);
+    if (!w || !(await ask(`Delete the workout "${w.name}"? Workouts you already logged with it stay in your history.`, "Delete"))) return false;
+    state = removeCustomWorkout(state, w.id);
+    ui.editorType = "A";
+  },
+  async "lib-remove"(el) {
+    const e = state.library.find((x) => x.id === el.dataset.id);
+    if (!e || !(await ask(`Remove ${e.name} from your exercise library? Workouts that use it keep it.`, "Remove"))) return false;
+    state = removeFromLibrary(state, e.id);
   },
   "export-file"() { exportData(); return false; },
   "copy-backup"() { copyBackup(); return false; },
@@ -1124,7 +1251,7 @@ const actions = {
     view = "manual";
     window.scrollTo(0, 0);
   },
-  "manual-type"(el) { ui.manual = manualDraft(state, el.dataset.type, ui.manual.date); },
+  "manual-type"(el) { ui.manual = manualDraft(state, el.dataset.type ?? "A", ui.manual.date, el.dataset.workout ?? null); },
   "manual-set"(el) {
     const ex = ui.manual.exercises[Number(el.dataset.ex)];
     const j = Number(el.dataset.set);
@@ -1142,7 +1269,7 @@ const actions = {
   "manual-cancel"() { ui.manual = null; view = "calendar"; },
   async "delete-workout"(el) {
     const h = state.history.find((x) => x.id === el.dataset.id);
-    if (!h || !(await ask(`Delete workout ${h.type} from ${isoDayLabel(h.date)}? It disappears from your history and graphs.`, "Delete"))) return false;
+    if (!h || !(await ask(`Delete ${sessionLabel(h)} from ${isoDayLabel(h.date)}? It disappears from your history and graphs.`, "Delete"))) return false;
     state = deleteWorkout(state, h.id);
   },
   async reset() {
@@ -1187,6 +1314,24 @@ document.addEventListener("change", async (e) => {
   if (input === "assist-weight") {
     const n = Number(t.value);
     if (Number.isFinite(n) && n >= 0) state.active.exercises[Number(t.dataset.ex)].weight = n;
+  } else if (input === "buddy-on") {
+    state.active.buddy = { on: t.checked, weights: state.active.buddy?.weights ?? {} };
+  } else if (input === "buddy-weight") {
+    const n = Number(t.value);
+    if (Number.isFinite(n) && n >= 0 && n <= 1000) state.active.buddy.weights[t.dataset.ex] = n;
+  } else if (input === "plate") {
+    const size = Number(t.dataset.size);
+    const plates = t.checked ? [...state.settings.plates, size] : state.settings.plates.filter((p) => p !== size);
+    if (!plates.length) return render(); // keep at least one plate size
+    state.settings.plates = [...new Set(plates)].sort((a, b) => b - a);
+  } else if (input === "micro-on") {
+    state.settings.micro = { ...state.settings.micro, enabled: t.checked };
+  } else if (input === "micro-pairs") {
+    const n = Math.round(Number(t.value));
+    if (n >= 1 && n <= 5) state.settings.micro = { ...state.settings.micro, pairs: n };
+  } else if (input === "workout-name") {
+    const name = t.value.trim().slice(0, 40);
+    if (name) state = updateCustomWorkout(state, ui.editorType, () => ({ name }));
   } else if (input === "profile-bodyweight") {
     const n = Number(t.value);
     state.profile.bodyweight = t.value === "" ? null : n >= 20 && n <= 400 ? Math.round(n * 10) / 10 : state.profile.bodyweight;
@@ -1202,14 +1347,15 @@ document.addEventListener("change", async (e) => {
   } else if (input === "tpl-sets" || input === "tpl-reps") {
     const n = Math.round(Number(t.value));
     const [min, max] = input === "tpl-sets" ? [1, 10] : [1, 300];
-    if (n >= min && n <= max) state.templates[ui.editorType][Number(t.dataset.i)][input === "tpl-sets" ? "sets" : "reps"] = n;
+    if (n >= min && n <= max) {
+      setEditorList(editorList().map((item, k) => (k === Number(t.dataset.i) ? { ...item, [input === "tpl-sets" ? "sets" : "reps"]: n } : item)));
+    }
   } else if (t.closest("#settings") && t.name) {
     const n = Number(t.value);
     if (!Number.isFinite(n) || n < 0) return render();
     const [group, key] = t.name.split(".");
     if (group === "weight") state.lifts[key] = { ...state.lifts[key], weight: n };
     else if (group === "inc") state.settings.increments[key] = n;
-    else if (group === "rest") state.settings.rest[key] = n;
     else if (group === "topBackoff") state.settings.topBackoff[key] = key === "backoffPercent" ? Math.min(50, n) : Math.max(1, Math.round(n));
     else if (t.name === "deloadSuggestAfter") state.settings.deloadSuggestAfter = Math.max(1, Math.round(n));
     else if (t.name === "deloadPercent") state.settings.deloadPercent = Math.min(50, Math.max(1, n));

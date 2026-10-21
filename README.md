@@ -21,13 +21,18 @@ All weights are in kg. All the numbers above can be changed in Settings.
 ## Features
 
 - **Today:** today's planned workout with weights, or the next one if it's a rest day. You can also train any day, or do the other workout instead.
-- **Logging:** tap a set circle to log full reps; tap again to lower the count. Plate calculator (tap the weight), warm-up sets, and − / + to adjust today's weight.
+- **Logging:** tap a set circle to log full reps; tap again to lower the count. Warm-up sets (with their plates) and − / + to adjust today's weight; − / + step to the next weight your plates can make.
+- **Plate loading:** under every barbell weight, a drawing of the right half of the bar shows the plates to load, labelled in kg and coloured like competition plates.
+- **Buddy mode:** tick "Training with a buddy" during a workout and enter your partner's weights. The bar is then loaded so the plates you both use stay on the inside, and only the outer plates change between your sets. For example, 100 kg vs 90 kg shares 25 + 10 and puts a 5 at the end. The plates to swap are drawn dashed.
 - **Past workouts:** in the Calendar, tap a past day → **Add a workout on this day**. It counts for graphs, strength standards and streaks but leaves your current working weights alone. Logged workouts can be deleted there too.
-- **Rest timer:** counts up and beeps at 1:30 and 3:00 after a made set, or 5:00 after a miss.
+- **Set stopwatch:** after you log a set, a stopwatch shows how long ago that was. No alerts.
+- **Your plates:** in Settings, tick the plate sizes your gym has (25, 20, 15, 10, 5, 2.5, 2, 1.25, 1 kg), and add microplates (0.5 kg) with how many pairs you have. Progression, deloads, back-off and warm-up weights only use weights those plates can make. With 1 kg increases and one pair of 0.5 kg plates, the overhead press goes 40 → 41 → 42.5 → 43.5 → 45 kg.
 - **Schedule (Program tab):** either pick training days and let A/B alternate across them, or set a fixed workout per weekday. Any number of days works, including 2 per week. A change applies from today; past weeks keep their old schedule.
 - **Calendar:** a month view of done, planned, moved and missed workouts. Tap a day to move that one workout to another date; the weekly schedule stays the same. "Put back" undoes a move.
 - **Streak:** the flame counts weeks in a row in which every scheduled workout was done. Moved workouts count in the week they land in. The current week counts once it's complete.
-- **Workout templates:** reorder exercises in A and B, switch a main lift between straight 5×5 and top set + back-off (1×5 top, then 4×5 at −10% by default), and add assistance work. The dropdown has the standard 5×5 assistance exercises (pull-ups, chin-ups, dips, skullcrushers, curls, hanging knee raises, planks, Romanian deadlifts, hip thrusts), or type your own.
+- **Workout templates:** reorder exercises in A and B, switch a main lift between straight 5×5 and top set + back-off (1×5 top, then 4×5 at −10% by default), and add assistance work. The dropdown has the standard 5×5 assistance exercises (pull-ups, chin-ups, dips, skullcrushers, curls, hanging knee raises, planks, Romanian deadlifts, hip thrusts), variations, your own exercises, or type a new one.
+- **Your own workouts:** besides A and B, create workouts from the main lifts, variations (front squat, pause squat, close-grip/incline/paused bench, Pendlay row, push press, sumo/deficit deadlift), assistance and your own exercises, each with its own sets and reps. They remember the weights you used but don't change the 5×5 working weights or the A/B order. Start them from the Today tab; they show in the calendar, history and graphs.
+- **Exercise library:** a custom exercise you add is saved and offered again in every exercise picker. Manage it in the Program tab.
 - **Progress:** a weight graph per lift (and per weighted assistance exercise).
 - **Strength standards:** enter bodyweight and sex. For each lift, the app compares your estimated 1-rep max with bodyweight-multiple milestones (Beginner → Novice → Intermediate → Advanced → Elite) and shows the % reached toward the next one. These standards are rough guides.
 - **Backup:** copy/paste JSON backup and restore. Data saved by older versions, including lb data, is upgraded automatically.
@@ -85,6 +90,7 @@ BUNDLETOOL=bundletool-all.jar UPLOAD_KEYSTORE=starkheben-upload.jks UPLOAD_STORE
 
 - **Export** saves a JSON file. On the web it's a normal download; in the Android app, Android's "save to…" dialog. On the Claude page, where downloads are blocked, you copy the text instead.
 - **Import** reads such a file and **replaces all current data**, after a warning that says how many workouts will be overwritten. In the web version this replaces your account's data on every device.
+- **Compatibility with version 1.0:** files from version 1.0 import fine, and version 1.0 imports newer files too. There, your own workouts show as "Workout A", and their definitions, the library and the plate settings are carried along unchanged.
 
 ## Layout
 
@@ -95,7 +101,8 @@ BUNDLETOOL=bundletool-all.jar UPLOAD_KEYSTORE=starkheben-upload.jks UPLOAD_STORE
 - `src/backends.js`: the two sync servers (Claude artifact db; Supabase with username/password accounts)
 - `src/config.js`: Supabase project URL and publishable key
 - `supabase/schema.sql`: database setup; `docs/SETUP.md`: hosting walkthrough
-- `src/app.js`: UI, storage and rest timer
+- `src/plates.js`: plate maths (loadable weights, fewest plates, buddy loading)
+- `src/app.js`: UI, storage and set stopwatch
 - `tests/`: unit tests for the logic modules
 - `sw.js`, `manifest.webmanifest`, `icon.svg`: offline and install support
 - `scripts/build-single.mjs`: bundles everything into one HTML file

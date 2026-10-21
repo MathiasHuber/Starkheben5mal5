@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   createState, startWorkout, finishWorkout, cycleSet, exerciseResult, progressLift, deloadLift, suggestDeload,
-  platesPerSide, warmupSets, migrate, validateState, roundDown, restTargets, defaultSettings, targetsFor,
+  warmupSets, migrate, validateState, roundDown, defaultSettings, targetsFor,
   moveItem, bestOneRepMax, liftSeries, backoffWeight,
 } from "../src/program.js";
 
@@ -120,13 +120,6 @@ test("set taps cycle 5 → 4 → … → 0 → empty", () => {
   assert.deepEqual(seen, [5, 4, 3, 2, 1, 0, null]);
 });
 
-test("plate calculator loads each side greedily", () => {
-  const s = defaultSettings();
-  assert.deepEqual(platesPerSide(102.5, s), { plates: [25, 15, 1.25], remainder: 0 });
-  assert.deepEqual(platesPerSide(20, s), { plates: [], remainder: 0 });
-  assert.equal(platesPerSide(21, s).remainder, 0.5);
-});
-
 test("warm-ups ramp below the work weight", () => {
   const s = defaultSettings();
   assert.deepEqual(warmupSets("squat", 20, s), []);
@@ -137,12 +130,6 @@ test("warm-ups ramp below the work weight", () => {
 test("rounding avoids float drift", () => {
   assert.equal(roundDown(7.5, 2.5), 7.5);
   assert.equal(roundDown(51.75, 2.5), 50);
-});
-
-test("rest targets depend on whether the set was made", () => {
-  const s = defaultSettings();
-  assert.deepEqual(restTargets(5, 5, s), [90, 180]);
-  assert.deepEqual(restTargets(3, 5, s), [300]);
 });
 
 test("progress series and best estimated 1RM come from history", () => {
@@ -229,4 +216,78 @@ test("export file round-trips and rejects junk", async () => {
   assert.ok(readBackup(JSON.stringify(s), TODAY), "plain state (older backups) still imports");
   assert.equal(readBackup("not json", TODAY), null);
   assert.equal(readBackup('{"format":"starkheben-5x5-backup","data":{}}', TODAY), null);
+});
+
+test("progression follows loadable weights (one pair of microplates)", () => {
+  const settings = { ...defaultSettings(), micro: { enabled: true, pairs: 1 }, increments: { ...defaultSettings().increments, ohp: 1 } };
+  let lift = { weight: 40, failures: 0 };
+  const seq = [40];
+  for (let i = 0; i < 4; i++) { lift = progressLift(lift, "success", "ohp", settings); seq.push(lift.weight); }
+  assert.deepEqual(seq, [40, 41, 42.5, 43.5, 45]);
+  assert.equal(deloadLift({ weight: 43.5, failures: 3 }, settings).weight, 38.5, "39.15 → 38.5 (37.5 + one pair of 0.5)");
+});
+
+test("your own workouts: free exercises, weights carried over, A/B order untouched", async () => {
+  const P = await import("../src/program.js");
+  let s = createState(TODAY);
+  s = P.addCustomWorkout(s, "Volume day", "wvol");
+  const front = P.VARIATIONS.find((v) => v.name === "Front Squat");
+  const squat = P.MAIN_CHOICES.find((v) => v.liftRef === "squat");
+  s = P.updateCustomWorkout(s, "wvol", (w) => ({ items: [P.exerciseItem(front, "i1"), { ...P.exerciseItem(squat, "i2"), sets: 3, reps: 8 }] }));
+  const session = P.startWorkout(s, "A", Date.UTC(2026, 9, 20), "wvol");
+  assert.equal(session.type, "A", "stored as A for version 1.0 compatibility");
+  assert.deepEqual(session.custom, { id: "wvol", name: "Volume day" });
+  assert.equal(P.sessionLabel(session), "Volume day");
+  assert.deepEqual(session.exercises.map((e) => [e.name, e.log.length, e.barbell, e.liftRef]), [["Front Squat", 3, true, undefined], ["Squat", 3, true, "squat"]]);
+  session.exercises[1].weight = 70;
+  session.exercises.forEach((ex) => { ex.log = P.targetsFor(ex, s.settings).map((t) => t.reps); });
+  const next = P.finishWorkout(s, { ...session, buddy: { on: true, weights: {} } });
+  assert.equal(next.nextWorkout, "A", "A/B order unchanged");
+  assert.equal(next.lifts.squat.weight, 20, "5×5 squat weight unchanged");
+  assert.equal(next.workouts[0].items[1].weight, 70, "weight remembered for next time");
+  assert.equal(next.history[0].buddy, undefined, "buddy weights aren't stored");
+  assert.ok(validateState(JSON.parse(JSON.stringify(next))));
+  // Manual past entry of your own workout.
+  const draft = P.manualDraft(next, "A", new Date(Date.UTC(2026, 9, 18)).toISOString(), "wvol");
+  assert.equal(draft.custom.name, "Volume day");
+  assert.equal(P.addManualWorkout(next, draft, "m1").history.find((h) => h.id === "m1").custom.id, "wvol");
+  assert.equal(P.removeCustomWorkout(next, "wvol").workouts.length, 0);
+});
+
+test("exercise library keeps custom exercises once", async () => {
+  const P = await import("../src/program.js");
+  let s = createState(TODAY);
+  s = P.addToLibrary(s, { name: "Face Pulls", sets: 3, reps: 15, unit: "reps" });
+  s = P.addToLibrary(s, { name: "face pulls", sets: 4, reps: 12, unit: "reps" });
+  assert.equal(s.library.length, 1);
+  s = P.removeFromLibrary(s, s.library[0].id);
+  assert.equal(s.library.length, 0);
+});
+
+test("export files stay compatible with app version 1.0, both ways", async () => {
+  const P = await import("../src/program.js");
+  const V1 = await import("./fixtures/v1.0/program.js");
+  // New → 1.0: a file with a custom workout, library and microplates imports in version 1.0.
+  let s = createState(TODAY);
+  s.settings.micro = { enabled: true, pairs: 1 };
+  s = P.addToLibrary(s, { name: "Face Pulls", sets: 3, reps: 15, unit: "reps" });
+  s = P.addCustomWorkout(s, "Volume day", "wvol");
+  s = P.updateCustomWorkout(s, "wvol", () => ({ items: [P.exerciseItem(P.VARIATIONS[0], "i1")] }));
+  const sess = P.startWorkout(s, "A", Date.UTC(2026, 9, 20), "wvol");
+  sess.exercises[0].log = [5, 5, 5];
+  s = P.finishWorkout(s, sess);
+  s = P.finishWorkout(s, logAll(P.startWorkout(s, "A", Date.UTC(2026, 9, 21)), s.settings));
+  const file = JSON.stringify(P.makeBackup(s));
+  const inOld = V1.readBackup(file, TODAY);
+  assert.ok(inOld, "version 1.0 accepts the new file");
+  assert.equal(inOld.history.length, 2);
+  // 1.0 → new: and the round trip through version 1.0 keeps the new parts.
+  const back = P.readBackup(JSON.stringify(V1.makeBackup(inOld)), TODAY);
+  assert.equal(back.workouts[0].name, "Volume day");
+  assert.equal(back.library[0].name, "Face Pulls");
+  assert.equal(back.settings.micro.enabled, true);
+  // A plain version 1.0 export (no new fields) imports with defaults.
+  const old = V1.createState(TODAY);
+  const fromOld = P.readBackup(JSON.stringify(V1.makeBackup(old)), TODAY);
+  assert.deepEqual([fromOld.workouts, fromOld.library, fromOld.settings.micro], [[], [], { enabled: false, pairs: 1 }]);
 });

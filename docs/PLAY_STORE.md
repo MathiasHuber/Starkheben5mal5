@@ -10,7 +10,7 @@ Everything the store needs is in this repository:
 | Phone screenshots 1080×1920 | `store/screenshots/` (6 images, example data) |
 | Privacy policy | `https://mathiashuber.github.io/Starkheben5mal5/privacy.html` (needs GitHub Pages on) |
 
-App details: package name `app.starkheben.fivebyfive` (permanent once published), version 1.0 (versionCode 5), targets Android 16 (API 36), runs on Android 5.0+.
+App details: package name `app.starkheben.fivebyfive` (permanent once published), version 1.1 (versionCode 6), targets Android 16 (API 36), runs on Android 5.0+.
 
 ## Keep these safe: the upload key
 
@@ -36,7 +36,7 @@ The bundle is signed with an **upload key** (`starkheben-upload.jks`, alias `upl
 
 - **App name:** `Starkheben 5×5`
 - **Short description** (80 characters max):
-  `Simple 5×5 barbell training: workouts, rest timer, progress and calendar.`
+  `Simple 5×5 barbell training: plate loading, progress, calendar and buddy mode.`
 - **Full description:**
 
   ```
@@ -46,8 +46,11 @@ The bundle is signed with an **upload key** (`starkheben-upload.jks`, alias `upl
 
   • Automatic progression: make all your reps and the weight goes up next time
   • Deload when you need it: after missed reps, one tap takes 10% off, rounded to plates you can load
-  • Rest timer that beeps and vibrates when it's time for the next set
-  • Plate calculator and warm-up sets for every lift
+  • See exactly which plates to load: a drawing of the bar for every weight
+  • Buddy mode: share a bar with a friend with the fewest plate switches
+  • Set your gym's plates, including 0.5 kg microplates for small jumps
+  • Stopwatch since your last set, and warm-up sets for every lift
+  • Build your own workouts from the main lifts, variations and your own exercises
   • Weekly schedule: pick your training days, 2 or 3 per week, or fix a workout per weekday
   • Calendar: see done and planned workouts, move a single workout, add past workouts
   • Progress graphs for every lift

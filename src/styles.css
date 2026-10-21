@@ -289,3 +289,34 @@ details summary { cursor: pointer; padding: 8px 0; color: var(--muted); }
 .plan .line.small { padding: 2px 0; }
 .stats strong { white-space: nowrap; }
 @media (max-width: 420px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 12px; } }
+
+/* plate loading */
+.loading { margin-top: 10px; }
+.loading p { margin: 4px 0 0; }
+.barbell { display: block; max-width: 100%; height: auto; overflow: visible; }
+.barbell .shaft, .barbell .sleeve { fill: var(--ring); }
+.barbell .collar { fill: var(--muted); }
+.barbell .plate rect { stroke: var(--text); stroke-opacity: 0.25; stroke-width: 1; }
+.barbell .plate text { font: 700 8.5px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; text-anchor: middle; dominant-baseline: central; }
+.barbell .plate.swap rect { stroke: var(--accent); stroke-opacity: 1; stroke-width: 2; stroke-dasharray: 3 2; }
+.load-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.load-row > span { min-width: 92px; font-variant-numeric: tabular-nums; }
+.warn { color: var(--warn); }
+.buddy-toggle { display: flex; gap: 12px; align-items: flex-start; cursor: pointer; }
+.buddy-toggle input { width: 22px; height: 22px; margin-top: 2px; accent-color: var(--accent); flex: none; }
+.buddy-field { margin-top: 10px; }
+
+/* settings checkboxes, text inputs */
+.check { display: inline-flex; align-items: center; gap: 8px; min-height: 40px; white-space: nowrap; }
+.check input { width: 20px; height: 20px; accent-color: var(--accent); }
+.plate-checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 0 10px; font-variant-numeric: tabular-nums; }
+.text-input {
+  min-height: 40px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg);
+  flex: 1 1 160px; min-width: 0;
+}
+.own-head { justify-content: space-between; }
+.own-head .inline { flex: 1 1 200px; }
+.own-head .inline input { width: 100%; }
+.buddy-toggle { white-space: normal; }
+.load-row { display: grid; grid-template-columns: auto minmax(0, 1fr); }
+.loading .barbell { max-width: 100%; height: auto; }

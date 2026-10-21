@@ -16,7 +16,7 @@ const out = args.find((a) => !a.startsWith("--")) ?? join(root, "dist", "starkhe
 
 // Modules in dependency order; their local imports and exports are stripped so they share one scope.
 // Used by the Claude page (syncs through the artifact db) and the Android app (--offline).
-const MODULES = ["src/config.js", "src/schedule.js", "src/standards.js", "src/program.js", "src/sync.js", "src/backends.js", "src/app.js"];
+const MODULES = ["src/config.js", "src/schedule.js", "src/standards.js", "src/plates.js", "src/program.js", "src/sync.js", "src/backends.js", "src/app.js"];
 const scripts = MODULES.map((m) => {
   const source = offline && m === "src/config.js"
     ? `// Offline build: no server, so no accounts or crew.\nexport const SUPABASE = { url: "", key: "" };\n`

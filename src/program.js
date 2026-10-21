@@ -1,6 +1,7 @@
 // Pure 5x5 program logic: no DOM, no storage. Everything here is unit tested. All weights are kg.
 import { defaultSchedule, isDateKey } from "./schedule.js";
 import { estimateOneRepMax } from "./standards.js";
+import { loadableAtOrAbove, loadableAtOrBelow } from "./plates.js";
 
 export const LIFTS = {
   squat: { name: "Squat", sets: 5, reps: 5 },
@@ -10,18 +11,34 @@ export const LIFTS = {
   deadlift: { name: "Deadlift", sets: 1, reps: 5 },
 };
 
-/** Standard 5x5 assistance work (as listed on stronglifts.com). */
+/** Standard 5x5 assistance work (as listed on stronglifts.com). `barbell` exercises get the plate calculator. */
 export const ASSISTANCE = [
   { name: "Pull-ups", sets: 3, reps: 8, unit: "reps" },
   { name: "Chin-ups", sets: 3, reps: 8, unit: "reps" },
   { name: "Dips", sets: 3, reps: 8, unit: "reps" },
   { name: "Skullcrushers", sets: 3, reps: 8, unit: "reps" },
-  { name: "Barbell Curl", sets: 3, reps: 8, unit: "reps" },
+  { name: "Barbell Curl", sets: 3, reps: 8, unit: "reps", barbell: true },
   { name: "Hanging Knee Raises", sets: 3, reps: 8, unit: "reps" },
   { name: "Plank", sets: 3, reps: 30, unit: "sec" },
-  { name: "Romanian Deadlift", sets: 3, reps: 8, unit: "reps" },
-  { name: "Hip Thrust", sets: 3, reps: 8, unit: "reps" },
+  { name: "Romanian Deadlift", sets: 3, reps: 8, unit: "reps", barbell: true },
+  { name: "Hip Thrust", sets: 3, reps: 8, unit: "reps", barbell: true },
 ];
+
+/** Barbell variations of the main lifts, for your own workouts. */
+export const VARIATIONS = [
+  { name: "Front Squat", sets: 3, reps: 5, unit: "reps", barbell: true },
+  { name: "Pause Squat", sets: 3, reps: 5, unit: "reps", barbell: true },
+  { name: "Close-Grip Bench Press", sets: 3, reps: 8, unit: "reps", barbell: true },
+  { name: "Incline Bench Press", sets: 3, reps: 8, unit: "reps", barbell: true },
+  { name: "Paused Bench Press", sets: 3, reps: 5, unit: "reps", barbell: true },
+  { name: "Pendlay Row", sets: 3, reps: 5, unit: "reps", barbell: true },
+  { name: "Push Press", sets: 3, reps: 5, unit: "reps", barbell: true },
+  { name: "Sumo Deadlift", sets: 1, reps: 5, unit: "reps", barbell: true },
+  { name: "Deficit Deadlift", sets: 1, reps: 5, unit: "reps", barbell: true },
+];
+
+/** The main lifts as free exercises for your own workouts (own sets, reps and weight; no 5×5 progression). */
+export const MAIN_CHOICES = Object.entries(LIFTS).map(([id, l]) => ({ name: l.name, sets: l.sets, reps: l.reps, unit: "reps", barbell: true, liftRef: id }));
 
 const START_WEIGHTS = { squat: 20, bench: 20, row: 30, ohp: 20, deadlift: 40 };
 const KG_PER_LB = 1 / 2.20462;
@@ -33,8 +50,9 @@ export function defaultSettings() {
     increments: { squat: 2.5, bench: 2.5, row: 2.5, ohp: 2.5, deadlift: 5 },
     deloadPercent: 10,
     deloadSuggestAfter: 3,
-    rest: { easy: 90, hard: 180, failed: 300 },
+    rest: { easy: 90, hard: 180, failed: 300 }, // unused since the stopwatch replaced rest alerts; kept for older app versions
     topBackoff: { backoffSets: 4, backoffReps: 5, backoffPercent: 10 },
+    micro: { enabled: false, pairs: 1 }, // 0.5 kg microplates
   };
 }
 
@@ -57,6 +75,8 @@ export function createState(today) {
     history: [],
     nextWorkout: "A",
     active: null,
+    workouts: [], // your own workouts besides A and B: { id, name, items }
+    library: [], // custom exercises, offered again when adding exercises
   };
 }
 
@@ -78,39 +98,23 @@ export function roundNearest(weight, step) {
   return (Math.round(w / s) * s) / 100;
 }
 
-/** Plates for ONE side of the bar, largest first. `remainder` > 0 means the load can't be made exactly. */
-export function platesPerSide(target, settings) {
-  let side = Math.round(((target - settings.bar) / 2) * 100);
-  const plates = [];
-  if (side <= 0) return { plates, remainder: 0 };
-  for (const p of [...settings.plates].sort((a, b) => b - a)) {
-    const cents = Math.round(p * 100);
-    while (side >= cents) {
-      plates.push(p);
-      side -= cents;
-    }
-  }
-  return { plates, remainder: side / 100 };
-}
-
 /** Warm-up ramp below the work weight: 2x5 empty bar, then roughly 50/70/85 %. */
 export function warmupSets(liftId, workWeight, settings) {
   const { bar } = settings;
   if (workWeight <= bar) return [];
-  const step = loadStep(settings);
   const sets = liftId === "deadlift" ? [] : [{ weight: bar, reps: 5 }, { weight: bar, reps: 5 }];
   for (const [pct, reps] of [[0.5, 5], [0.7, 3], [0.85, 2]]) {
-    const w = roundDown(workWeight * pct, step);
+    const w = loadableAtOrBelow(workWeight * pct, settings);
     const last = sets.length ? sets[sets.length - 1].weight : bar;
     if (w > last && w < workWeight && w > bar) sets.push({ weight: w, reps });
   }
-  if (liftId === "deadlift" && sets.length === 0) sets.push({ weight: roundDown(workWeight * 0.6, step) || bar, reps: 5 });
+  if (liftId === "deadlift" && sets.length === 0) sets.push({ weight: loadableAtOrBelow(workWeight * 0.6, settings), reps: 5 });
   return sets;
 }
 
 /** Back-off weight: the top-set weight minus the back-off %, rounded down to a loadable weight. */
 export function backoffWeight(weight, percent, settings) {
-  return Math.max(settings.bar, roundDown(weight * (1 - percent / 100), loadStep(settings)));
+  return Math.max(settings.bar, loadableAtOrBelow(weight * (1 - percent / 100), settings));
 }
 
 /** The sets an exercise asks for: [{ reps, weight, top? }]. */
@@ -125,16 +129,36 @@ export function targetsFor(ex, settings) {
   return Array.from({ length: sets }, () => ({ reps, weight: ex.weight }));
 }
 
-export function startWorkout(state, type, now = Date.now()) {
-  const exercises = state.templates[type].map((item) => {
+/** A free exercise (assistance, or any exercise of your own workouts) as it appears in a session. */
+const freeExercise = (item) => ({
+  type: "assist", key: item.id, name: item.name, sets: item.sets, reps: item.reps, unit: item.unit, weight: item.weight,
+  ...(item.barbell ? { barbell: true } : {}), ...(item.liftRef ? { liftRef: item.liftRef } : {}),
+});
+
+/** The exercises of workout A, B, or one of your own (by id). */
+export function workoutItems(state, type, workoutId) {
+  if (workoutId) return state.workouts.find((w) => w.id === workoutId)?.items ?? [];
+  return state.templates[type];
+}
+
+/**
+ * Starts workout A or B, or one of your own (`workoutId`). Your own workouts are stored with type "A"
+ * plus `custom: { id, name }`, which keeps export files readable by app version 1.0.
+ */
+export function startWorkout(state, type, now = Date.now(), workoutId = null) {
+  const custom = workoutId ? state.workouts.find((w) => w.id === workoutId) : null;
+  const exercises = workoutItems(state, type, custom?.id).map((item) => {
     const ex = item.type === "main"
       ? { type: "main", liftId: item.liftId, scheme: item.scheme, weight: state.lifts[item.liftId].weight,
           ...(item.scheme === "topBackoff" ? { backoff: { ...state.settings.topBackoff } } : {}) }
-      : { type: "assist", key: item.id, name: item.name, sets: item.sets, reps: item.reps, unit: item.unit, weight: item.weight };
+      : freeExercise(item);
     return { ...ex, log: Array(targetsFor(ex, state.settings).length).fill(null) };
   });
-  return { id: String(now), date: new Date(now).toISOString(), type, exercises };
+  return { id: String(now), date: new Date(now).toISOString(), type: custom ? "A" : type, ...(custom ? { custom: { id: custom.id, name: custom.name } } : {}), exercises };
 }
+
+/** "Workout A", "Workout B", or the name of your own workout. */
+export const sessionLabel = (s) => (s.custom ? s.custom.name : `Workout ${s.type}`);
 
 /** Tap cycle for a set: empty → full reps → one fewer … → 0 → empty. Timed sets just toggle. */
 export function cycleSet(current, targetReps, unit = "reps") {
@@ -157,14 +181,15 @@ export function exerciseResult(ex, settings) {
 
 /** Next weight after a session. Failing never deloads by itself: the lifter decides (see deloadLift). */
 export function progressLift(lift, result, liftId, settings) {
-  if (result === "success") return { weight: lift.weight + settings.increments[liftId], failures: 0, change: "increase" };
+  // The next weight up that the plates can make (e.g. 1 kg steps with one pair of 0.5 kg plates: 40, 41, 42.5, 43.5, 45).
+  if (result === "success") return { weight: loadableAtOrAbove(lift.weight + settings.increments[liftId], settings), failures: 0, change: "increase" };
   if (result === "failed") return { weight: lift.weight, failures: lift.failures + 1, change: "repeat" };
   return { weight: lift.weight, failures: lift.failures, change: "none" };
 }
 
 /** Takes the deload % off and rounds down to a weight the plates can make, never below the empty bar. */
 export function deloadLift(lift, settings) {
-  const reduced = roundDown(lift.weight * (1 - settings.deloadPercent / 100), loadStep(settings));
+  const reduced = loadableAtOrBelow(lift.weight * (1 - settings.deloadPercent / 100), settings);
   return { weight: Math.max(settings.bar, reduced), failures: 0 };
 }
 
@@ -172,13 +197,16 @@ export const suggestDeload = (lift, settings) => lift.failures >= settings.deloa
 
 export function finishWorkout(state, session, now = Date.now()) {
   const lifts = { ...state.lifts };
-  const templates = { ...state.templates, [session.type]: state.templates[session.type].map((t) => ({ ...t })) };
+  const customId = session.custom?.id;
+  const templates = customId ? state.templates : { ...state.templates, [session.type]: state.templates[session.type].map((t) => ({ ...t })) };
+  const workouts = customId ? state.workouts.map((w) => (w.id === customId ? { ...w, items: w.items.map((t) => ({ ...t })) } : w)) : state.workouts;
+  const items = customId ? workouts.find((w) => w.id === customId)?.items ?? [] : templates[session.type];
   const exercises = session.exercises.map((ex) => {
     const result = exerciseResult(ex, state.settings);
     const weights = targetsFor(ex, state.settings).map((t) => t.weight);
     if (ex.type === "assist") {
-      // Carry the assistance weight over to next time.
-      const item = templates[session.type].find((t) => t.id === ex.key);
+      // Carry the weight over to next time.
+      const item = items.find((t) => t.id === ex.key);
       if (item) item.weight = ex.weight;
       return { ...ex, result, weights };
     }
@@ -186,21 +214,52 @@ export function finishWorkout(state, session, now = Date.now()) {
     lifts[ex.liftId] = { weight: next.weight, failures: next.failures };
     return { ...ex, result, weights, change: next.change, nextWeight: next.weight };
   });
-  const entry = { ...session, exercises, finishedAt: new Date(now).toISOString() };
+  const { buddy, ...rest } = session; // buddy weights are only for loading the bar during the workout
+  const entry = { ...rest, exercises, finishedAt: new Date(now).toISOString() };
   return {
     ...state,
     lifts,
     templates,
+    workouts,
     history: sortHistory([entry, ...state.history]),
-    nextWorkout: session.type === "A" ? "B" : "A",
+    // Your own workouts don't move the A/B order.
+    nextWorkout: customId ? state.nextWorkout : session.type === "A" ? "B" : "A",
     active: null,
   };
 }
 
-/** Rest milestones (seconds) after a set: easy/hard after a made set, the long rest after a miss. */
-export function restTargets(reps, targetReps, settings) {
-  return reps < targetReps ? [settings.rest.failed] : [settings.rest.easy, settings.rest.hard];
+// ---------- your own workouts and exercise library ----------
+
+const slug = () => Math.random().toString(36).slice(2, 10);
+
+export function addCustomWorkout(state, name, id = `w${slug()}`) {
+  return { ...state, workouts: [...state.workouts, { id, name: name.trim().slice(0, 40) || "My workout", items: [] }] };
 }
+
+export function updateCustomWorkout(state, id, change) {
+  return { ...state, workouts: state.workouts.map((w) => (w.id === id ? { ...w, ...change(w) } : w)) };
+}
+
+export function removeCustomWorkout(state, id) {
+  return { ...state, workouts: state.workouts.filter((w) => w.id !== id) };
+}
+
+/** Remembers a custom exercise so it's offered again; names are unique (case-insensitive). */
+export function addToLibrary(state, ex) {
+  if (state.library.some((e) => e.name.toLowerCase() === ex.name.toLowerCase())) return state;
+  const entry = { id: `x${slug()}`, name: ex.name, sets: ex.sets, reps: ex.reps, unit: ex.unit, ...(ex.barbell ? { barbell: true } : {}) };
+  return { ...state, library: [...state.library, entry] };
+}
+
+export function removeFromLibrary(state, id) {
+  return { ...state, library: state.library.filter((e) => e.id !== id) };
+}
+
+/** A template item for a free exercise, from a catalogue or library entry. */
+export const exerciseItem = (choice, id = `i${slug()}`) => ({
+  type: "assist", id, name: choice.name, sets: choice.sets, reps: choice.reps, unit: choice.unit, weight: 0,
+  ...(choice.barbell ? { barbell: true, weight: 20 } : {}), ...(choice.liftRef ? { liftRef: choice.liftRef } : {}),
+});
 
 /** Moves a template item up (-1) or down (+1). */
 export function moveItem(list, index, dir) {
@@ -251,15 +310,16 @@ export function weightOn(state, liftId, dateIso) {
 }
 
 /** A blank-ish workout to fill in after the fact: the template's exercises at the weights of that day, every set done. */
-export function manualDraft(state, type, dateIso) {
-  const exercises = state.templates[type].map((item) => {
+export function manualDraft(state, type, dateIso, workoutId = null) {
+  const custom = workoutId ? state.workouts.find((w) => w.id === workoutId) : null;
+  const exercises = workoutItems(state, type, custom?.id).map((item) => {
     const ex = item.type === "main"
       ? { type: "main", liftId: item.liftId, scheme: item.scheme, weight: weightOn(state, item.liftId, dateIso),
           ...(item.scheme === "topBackoff" ? { backoff: { ...state.settings.topBackoff } } : {}) }
-      : { type: "assist", key: item.id, name: item.name, sets: item.sets, reps: item.reps, unit: item.unit, weight: item.weight };
+      : freeExercise(item);
     return { ...ex, log: targetsFor(ex, state.settings).map((t) => t.reps) };
   });
-  return { type, date: dateIso, exercises };
+  return { type: custom ? "A" : type, ...(custom ? { custom: { id: custom.id, name: custom.name } } : {}), date: dateIso, exercises };
 }
 
 /**
@@ -272,7 +332,7 @@ export function addManualWorkout(state, draft, id) {
     result: exerciseResult(ex, state.settings),
     weights: targetsFor(ex, state.settings).map((t) => t.weight),
   }));
-  const entry = { id, date: draft.date, type: draft.type, manual: true, exercises, finishedAt: draft.date };
+  const entry = { id, date: draft.date, type: draft.type, ...(draft.custom ? { custom: draft.custom } : {}), manual: true, exercises, finishedAt: draft.date };
   return { ...state, history: sortHistory([...state.history, entry]) };
 }
 
@@ -354,25 +414,35 @@ function migrateV1(v1, today) {
 
 const num = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
 const isType = (v) => v === "A" || v === "B";
-const isName = (v) => typeof v === "string" && v.trim().length > 0 && v.length <= 60;
+const isName = (v, max = 60) => typeof v === "string" && v.trim().length > 0 && v.length <= max;
+const isId = (v) => typeof v === "string" && /^[A-Za-z0-9_-]{1,40}$/.test(v);
+const optBool = (v) => v === undefined || typeof v === "boolean";
+const optLift = (v) => v === undefined || Boolean(LIFTS[v]);
 
 function validExercise(ex) {
   if (!ex || !num(ex.weight) || !Array.isArray(ex.log) || !ex.log.every((r) => r === null || num(r))) return false;
   if (ex.type === "main") return Boolean(LIFTS[ex.liftId]) && ["straight", "topBackoff"].includes(ex.scheme);
-  if (ex.type === "assist") return isName(ex.name) && num(ex.sets) && num(ex.reps) && ["reps", "sec"].includes(ex.unit);
+  if (ex.type === "assist") return isName(ex.name) && num(ex.sets) && num(ex.reps) && ["reps", "sec"].includes(ex.unit) && optBool(ex.barbell) && optLift(ex.liftRef);
   return false;
 }
 
 /** Checks an in-progress or finished session. Its id doubles as a storage key, so it's restricted. */
 export function validateSession(s) {
-  return Boolean(s) && typeof s.id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(s.id) && isType(s.type) && typeof s.date === "string" && Array.isArray(s.exercises) && s.exercises.every(validExercise);
+  return Boolean(s) && typeof s.id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(s.id) && isType(s.type) && typeof s.date === "string"
+    && (s.custom === undefined || (isId(s.custom?.id) && isName(s.custom?.name, 40)))
+    && Array.isArray(s.exercises) && s.exercises.every(validExercise);
 }
 
 function validTemplateItem(t) {
   if (t?.type === "main") return Boolean(LIFTS[t.liftId]) && ["straight", "topBackoff"].includes(t.scheme);
   return t?.type === "assist" && typeof t.id === "string" && isName(t.name) && num(t.sets) && t.sets >= 1 && t.sets <= 10
-    && num(t.reps) && ["reps", "sec"].includes(t.unit) && num(t.weight);
+    && num(t.reps) && ["reps", "sec"].includes(t.unit) && num(t.weight) && optBool(t.barbell) && optLift(t.liftRef);
 }
+
+const validWorkout = (w) => w && isId(w.id) && isName(w.name, 40) && Array.isArray(w.items) && w.items.length <= 30
+  && w.items.every((t) => t?.type === "assist" && validTemplateItem(t));
+const validLibraryEntry = (e) => e && isId(e.id) && isName(e.name) && num(e.sets) && e.sets >= 1 && e.sets <= 10
+  && num(e.reps) && ["reps", "sec"].includes(e.unit) && optBool(e.barbell);
 
 function validSchedule(s) {
   return s && isDateKey(s.since) && ["alternate", "fixed"].includes(s.mode)
@@ -397,5 +467,16 @@ export function validateState(data) {
   if (!Array.isArray(data.schedules) || !data.schedules.length || !data.schedules.every(validSchedule)) return null;
   if (!data.overrides || typeof data.overrides !== "object" || !Object.entries(data.overrides).every(([k, v]) => isDateKey(k) && isDateKey(v))) return null;
   if (!Array.isArray(data.history) || !data.history.every(validateSession)) return null;
-  return { ...data, active: null };
+  // Added after version 1.0, so optional: older exports simply don't have them.
+  const m = s.micro;
+  if (!(m === undefined || (m && typeof m.enabled === "boolean" && Number.isInteger(m.pairs) && m.pairs >= 1 && m.pairs <= 5))) return null;
+  if (!(data.workouts === undefined || (Array.isArray(data.workouts) && data.workouts.length <= 20 && data.workouts.every(validWorkout)))) return null;
+  if (!(data.library === undefined || (Array.isArray(data.library) && data.library.length <= 200 && data.library.every(validLibraryEntry)))) return null;
+  return {
+    ...data,
+    settings: { ...s, micro: m ?? { enabled: false, pairs: 1 } },
+    workouts: data.workouts ?? [],
+    library: data.library ?? [],
+    active: null,
+  };
 }
